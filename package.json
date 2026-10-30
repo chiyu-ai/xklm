@@ -1,0 +1,23 @@
+{
+  "name": "farm-monitor",
+  "version": "1.0.0",
+  "description": "基于 ESP32-S3 的养殖环境监测与辅助诊断系统",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "esp32-s3",
+    "iot",
+    "environment-monitoring",
+    "livestock",
+    "nodejs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}
