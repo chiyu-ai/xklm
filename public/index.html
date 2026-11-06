@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>养殖环境实时监测系统</title>
-  <link rel="stylesheet" href="style.css?v=20261104" />
+  <link rel="stylesheet" href="style.css?v=20261114" />
 </head>
 <body>
   <!-- 登录界面 -->
@@ -229,14 +229,6 @@
         <label>体重（kg，可选）</label>
         <input type="number" id="dmWeight" min="0" step="0.1" placeholder="如：2.5" />
       </div>
-      <div class="form-row">
-        <label>饲料槽容量（kg）</label>
-        <input type="number" id="dmFeedCap" min="0" step="0.1" placeholder="如：50" />
-      </div>
-      <div class="form-row">
-        <label>当前饲料量（kg）</label>
-        <input type="number" id="dmFeedAmt" min="0" step="0.1" placeholder="如：35" />
-      </div>
       <div class="modal-actions">
         <button class="btn ghost" id="dmCancel">取消</button>
         <button class="btn primary" id="dmSave">保存</button>
@@ -258,6 +250,21 @@
     </div>
   </div>
 
+  <!-- 天气弹窗 -->
+  <div class="modal-mask" id="weatherModal">
+    <div class="detail-panel market-panel">
+      <div class="detail-head">
+        <h3 id="weatherTitle">当地天气</h3>
+        <button class="btn ghost" id="weatherClose" type="button">✕ 关闭</button>
+      </div>
+      <div class="weather-search">
+        <input type="text" id="weatherCity" placeholder="输入城市或地区，如：北京、成都、哈尔滨" />
+        <button class="btn primary" id="weatherSearch" type="button">查询</button>
+      </div>
+      <div class="weather-body" id="weatherBody"></div>
+    </div>
+  </div>
+
   <!-- 市场行情弹窗 -->
   <div class="modal-mask" id="marketModal">
     <div class="detail-panel market-panel">
@@ -273,10 +280,13 @@
 
   <!-- 真实知识库弹窗 -->
   <div class="modal-mask" id="realKbModal">
-    <div class="detail-panel market-panel">
+    <div class="detail-panel market-panel" id="realKbPanel">
       <div class="detail-head">
         <h3>真实知识库（本场患病记录）</h3>
-        <button class="btn ghost" id="realKbClose" type="button">✕ 关闭</button>
+        <div class="head-actions">
+          <button class="btn ghost" id="realKbExpand" type="button">⛶ 放大</button>
+          <button class="btn ghost" id="realKbClose" type="button">✕ 关闭</button>
+        </div>
       </div>
       <div class="real-kb-body" id="realKbBody"></div>
     </div>
@@ -284,10 +294,13 @@
 
   <!-- 预警记录弹窗 -->
   <div class="modal-mask" id="warningModal">
-    <div class="detail-panel market-panel">
+    <div class="detail-panel market-panel" id="warningPanel">
       <div class="detail-head">
         <h3>预警记录</h3>
-        <button class="btn ghost" id="warningClose" type="button">✕ 关闭</button>
+        <div class="head-actions">
+          <button class="btn ghost" id="warningExpand" type="button">⛶ 放大</button>
+          <button class="btn ghost" id="warningClose" type="button">✕ 关闭</button>
+        </div>
       </div>
       <div class="warning-body" id="warningBody"></div>
     </div>
@@ -318,6 +331,17 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261104"></script>
+  <!-- AI 预警放大弹窗 -->
+  <div class="modal-mask" id="recogModal">
+    <div class="detail-panel recog-panel">
+      <div class="detail-head">
+        <h3 id="recogModalTitle">AI 健康预警分析</h3>
+        <button class="btn ghost" id="recogModalClose" type="button">✕ 关闭</button>
+      </div>
+      <div class="recog-modal-body" id="recogModalBody"></div>
+    </div>
+  </div>
+
+  <script src="app.js?v=20261114"></script>
 </body>
 </html>

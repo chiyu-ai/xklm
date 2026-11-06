@@ -25,7 +25,7 @@
 #include "esp_camera.h"
 #include <mbedtls/base64.h>
 
-// ==================== WiFi 与服务器 ====================
+// WiFi 与服务器
 const char* ssid      = "你的WiFi名称";
 const char* password  = "你的WiFi密码";
 const char* serverUrl = "http://106.55.251.138:3000/api/data";
@@ -33,7 +33,7 @@ const char* camUrl    = "http://106.55.251.138:3000/api/camera/esp32-01";
 const char* DEVICE_ID = "esp32-01";
 const char* DEVICE_NAME = "1号鸡舍";
 
-// ==================== 传感器引脚（避开摄像头占用的 4,5,6,7,8,9,10,11,12,13,15,16,17,18） ====================
+// 传感器引脚（避开摄像头占用的 4,5,6,7,8,9,10,11,12,13,15,16,17,18）
 #define PIN_DHT     47   // DHT11 数据（原14读不到，改到47）
 #define DHTTYPE     DHT11
 #define PIN_SOIL    1    // 土壤 AO  ADC1_CH0
@@ -48,7 +48,7 @@ const char* DEVICE_NAME = "1号鸡舍";
 #define OLED_SDA    41   // OLED SDA
 #define OLED_SCL    42   // OLED SCL
 
-// ==================== 摄像头引脚（板载固定，ESP32-S3-EYE 标准） ====================
+// 摄像头引脚（板载固定，ESP32-S3-EYE 标准）
 #define CAM_XCLK  15
 #define CAM_SIOD  4
 #define CAM_SIOC  5
@@ -66,7 +66,7 @@ const char* DEVICE_NAME = "1号鸡舍";
 #define CAM_PWDN  -1
 #define CAM_RESET -1
 
-// ==================== 阈值与标定 ====================
+// 阈值与标定
 #define TEMP_MAX      35.0f
 #define TEMP_MIN      10.0f
 #define FLAME_ACTIVE  LOW
@@ -105,7 +105,7 @@ unsigned long lastRead = 0, lastReport = 0, lastPage = 0, lastCam = 0;
 int page = 0;
 bool wifiOk = false, camOk = false;
 
-// ==================== 摄像头初始化 ====================
+// 摄像头初始化
 bool initCamera() {
   camera_config_t c;
   c.ledc_channel = LEDC_CHANNEL_0;
@@ -150,7 +150,7 @@ String base64Encode(const uint8_t* data, size_t len) {
   return s;
 }
 
-// ==================== MJPEG 视频流 ====================
+// MJPEG 视频流
 void handleStream() {
   WiFiClient client = streamServer.client();
   client.setNoDelay(true);   // 禁用 Nagle 算法，降低延迟、提升帧率
@@ -240,19 +240,16 @@ void loop() {
   }
 }
 
-// JW01 串口 CO2：9 字节帧，0x2C 开头，前 8 字节和 = 第 9 字节（校验）
+// JW01 串口 CO2：6 字节帧（2C HH LL X Y CK），前 5 字节之和 = 第 6 字节（校验）
 float readCO2() {
   while (co2Serial.available()) {
     uint8_t b = co2Serial.read();
     if (co2Idx == 0 && b != 0x2C) continue;
     co2Frame[co2Idx++] = b;
-    if (co2Idx >= 9) {
+    if (co2Idx >= 6) {
       uint8_t sum = 0;
-      for (int i = 0; i < 8; i++) sum += co2Frame[i];
-      Serial.print("[JW01] ");
-      for (int i = 0; i < 9; i++) Serial.printf("%02X ", co2Frame[i]);
-      Serial.printf("sum=%02X\n", sum);
-      if (sum == co2Frame[8]) {
+      for (int i = 0; i < 5; i++) sum += co2Frame[i];
+      if (sum == co2Frame[5]) {
         co2 = (co2Frame[1] << 8) | co2Frame[2];
       }
       co2Idx = 0;

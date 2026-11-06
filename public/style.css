@@ -443,7 +443,7 @@ body {
   font-size: 13px; padding: 10px 12px; border-radius: 10px; background: var(--card-2);
   border: 1px solid var(--border); min-height: 40px; color: var(--text);
 }
-.recog-result.warn { background: var(--danger-soft); border-color: #f0c2c1; color: #9a2f2f; }
+.recog-result.warn { background: var(--card-2); border-color: #f0c2c1; border-left: 4px solid var(--danger); color: var(--text); }
 .recog-result .recog-time { color: var(--text-muted); font-size: 11px; margin-top: 4px; }
 
 /* ---------- 开关 ---------- */
@@ -745,3 +745,97 @@ body {
 /* 主对话置顶 */
 .convo-main-row { margin-bottom: 6px; }
 .convo-main-row .convo-chip { background: var(--card-2); border-color: var(--accent); }
+
+.feed-hint { font-size: 11px; color: var(--text-muted); margin-top: 8px; line-height: 1.5; }
+
+/* 天气弹窗 */
+.weather-search { display: flex; gap: 10px; margin-bottom: 16px; }
+.weather-search input { flex: 1; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; font-size: 14px; outline: none; }
+.weather-search input:focus { border-color: var(--accent); }
+.weather-title { font-size: 18px; font-weight: 700; color: #6b3d1f; margin-bottom: 10px; }
+.weather-risk { background: var(--danger-soft); color: var(--danger); border-radius: 10px; padding: 8px 12px; font-size: 13px; margin-bottom: 12px; }
+.weather-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+.weather-item { background: var(--card-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.weather-item span { font-size: 12px; color: var(--text-muted); }
+.weather-item b { font-size: 15px; color: var(--text); }
+.weather-chart-title { font-size: 14px; font-weight: 700; color: #6b3d1f; margin: 16px 0 8px; }
+.weather-daily { display: flex; gap: 10px; }
+.weather-day { flex: 1; background: var(--card-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center; font-size: 12px; }
+.wd-date { color: var(--text-muted); margin-bottom: 4px; }
+.wd-desc { font-size: 13px; margin-bottom: 4px; }
+.wd-temp b { color: var(--accent); font-size: 15px; }
+.wd-sub { color: var(--text-muted); margin-top: 4px; }
+
+/* AI 预警结果排版：标题分级、条目间距、警示只做左侧色条 */
+.recog-result h3 { font-size: 14.5px; font-weight: 700; color: #b45309; margin: 15px 0 7px; padding-left: 9px; border-left: 3px solid var(--accent); }
+.recog-result h4 { font-size: 13.5px; font-weight: 700; color: #7a4a1d; margin: 12px 0 6px; padding-left: 9px; border-left: 3px solid var(--accent-2); }
+.recog-result h3:first-child, .recog-result h4:first-child { margin-top: 4px; }
+.recog-result p { margin: 5px 0; line-height: 1.65; }
+.recog-result ul, .recog-result ol { margin: 5px 0 8px 20px; }
+.recog-result li { margin: 3px 0; line-height: 1.6; }
+.recog-result strong { color: #6b3d1f; }
+.recog-result hr { border: none; border-top: 1px dashed var(--border); margin: 10px 0; }
+.recog-updating { font-size: 11px; color: var(--accent); margin-top: 6px; }
+
+/* AI 预警工作状态 */
+.recog-result.loading { background: var(--card-2); border-color: var(--border); }
+.warn-steps { display: flex; flex-direction: column; gap: 9px; margin: 10px 0 8px; }
+.warn-step { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--text-muted); transition: color .2s; }
+.warn-step.active { color: var(--accent); font-weight: 600; }
+.warn-step.done { color: var(--accent-2); }
+.ws-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: none; }
+.warn-step.active .ws-dot { background: var(--accent); animation: pulseDot 1s ease-in-out infinite; }
+.warn-step.done .ws-dot { background: var(--accent-2); }
+@keyframes pulseDot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+
+/* AI 预警进度条 */
+.warn-progress { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin: 8px 0 12px; }
+.warn-progress-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .4s; }
+
+/* 预警结果头部 + 放大按钮 */
+.recog-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.recog-zoom { border: 1px solid var(--border); background: var(--card); color: var(--accent); font-size: 11px; padding: 3px 9px; border-radius: 8px; cursor: pointer; flex: none; }
+.recog-zoom:hover { border-color: var(--accent); background: var(--accent-soft); }
+
+/* 放大弹窗 */
+.recog-panel { width: 1000px; max-width: 94vw; max-height: 92vh; padding: 22px 26px; }
+.recog-modal-body { font-size: 14px; overflow-y: auto; max-height: 76vh; padding: 4px 2px 8px; }
+.recog-modal-body h3 { font-size: 17px; font-weight: 700; color: #b45309; margin: 18px 0 8px; padding-left: 10px; border-left: 4px solid var(--accent); }
+.recog-modal-body h4 { font-size: 15px; font-weight: 700; color: #7a4a1d; margin: 14px 0 6px; padding-left: 10px; border-left: 3px solid var(--accent-2); }
+.recog-modal-body p, .recog-modal-body li { line-height: 1.75; }
+.recog-modal-body ul, .recog-modal-body ol { margin: 6px 0 10px 22px; }
+.recog-modal-body strong { color: #6b3d1f; }
+
+/* 弹窗头部按钮组 */
+.head-actions { display: flex; gap: 8px; }
+
+/* 放大模式：面板占满屏幕，内容区自适应滚动 */
+.detail-panel.expanded { width: 96vw !important; max-width: 96vw !important; height: 94vh; max-height: 94vh; display: flex; flex-direction: column; }
+.detail-panel.expanded .warning-body { flex: 1; min-height: 0; max-height: none; grid-template-columns: 320px 1fr; }
+.detail-panel.expanded .warning-list,
+.detail-panel.expanded .warning-view { max-height: none; height: 100%; }
+.detail-panel.expanded .real-kb-body { flex: 1; min-height: 0; max-height: none; overflow-y: auto; }
+.detail-panel.expanded .real-kb-body .rk-records,
+.detail-panel.expanded .real-kb-body .rk-queries { max-height: none; }
+
+/* 记录内容更好读 */
+.warning-view { font-size: 13.5px; line-height: 1.7; }
+.warning-list .warning-item.active { background: var(--accent-soft); border-color: var(--accent); }
+
+/* 预警记录布局修复：工具栏横跨两列，列表在左窄列，内容在右宽列 */
+.warning-body .warning-toolbar { grid-column: 1 / -1; margin-bottom: 2px; }
+.warning-body .warning-list { grid-column: 1; }
+.warning-body .warning-view { grid-column: 2; min-height: 320px; }
+.detail-panel.expanded .warning-body { grid-template-columns: 300px 1fr; }
+.detail-panel.expanded .warning-view { min-height: 0; }
+
+/* 内容框更醒目 */
+.warning-view { background: #fffdf8; border: 1px solid var(--border); }
+.warning-view .warning-pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 13.5px; line-height: 1.75; color: var(--text); }
+
+/* 知识库查询记录：回答内容 */
+.rk-answer { margin-top: 6px; padding: 8px 10px; background: #fffdf8; border: 1px dashed var(--border); border-radius: 8px; font-size: 12.5px; line-height: 1.65; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.rk-answer-short, .rk-answer-full { display: block; }
+.rk-answer-full { white-space: pre-wrap; }
+.rk-more { margin-top: 6px; border: 1px solid var(--border); background: var(--card); color: var(--accent); font-size: 11px; padding: 2px 8px; border-radius: 6px; cursor: pointer; }
+.rk-more:hover { border-color: var(--accent); background: var(--accent-soft); }

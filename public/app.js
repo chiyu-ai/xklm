@@ -21,7 +21,7 @@ const METRIC_LABELS = {
   light: '光照', lux: '光照',
   soil: '土壤湿度', water: '水位', flame: '火焰',
   feed_activity: '进食活动', feeding: '进食', vibration: '振动',
-  feed_level: '饲料槽余量', feed_weight: '饲料槽重量',
+  feed_level: '饲料槽余量',
   ph: 'pH 值', noise: '噪声', wind: '风速',
   pressure: '气压', rain: '降雨量', h2s: '硫化氢',
   pm25: 'PM2.5', o2: '氧气', soil_temp: '土壤温度', oxygen: '氧气'
@@ -33,12 +33,12 @@ const METRIC_UNITS = {
   co2: 'ppm', light: '%', lux: 'lux',
   soil: '%', water: '%', flame: '',
   feed_activity: '', feeding: '', vibration: '',
-  feed_level: '%', feed_weight: 'kg',
+  feed_level: '%',
   ph: '', noise: 'dB', wind: 'm/s',
   pressure: 'hPa', rain: 'mm', h2s: 'ppm',
   pm25: 'μg/m³', o2: '%', soil_temp: '°C', oxygen: '%'
 };
-const METRIC_ORDER = ['temperature', 'humidity', 'ammonia', 'co2', 'h2s', 'soil', 'water', 'light', 'flame', 'wind', 'pressure', 'rain', 'pm25', 'noise', 'o2', 'soil_temp', 'feed_level', 'feed_weight', 'feed_activity'];
+const METRIC_ORDER = ['temperature', 'humidity', 'ammonia', 'co2', 'h2s', 'soil', 'water', 'light', 'flame', 'wind', 'pressure', 'rain', 'pm25', 'noise', 'o2', 'soil_temp', 'feed_activity'];
 
 function metricLabel(key) { return METRIC_LABELS[key] || key; }
 function metricUnit(key) { return METRIC_UNITS[key] || ''; }
@@ -336,17 +336,22 @@ function renderStatusbar() {
 function avg(arr) { return arr.reduce((s, x) => s + x, 0) / arr.length; }
 
 // 今日天气（天气局实时数据）
+function savedCity() { return localStorage.getItem('weather-city') || ''; }
+
+async function fetchWeather(city) {
+  const res = await fetch('/api/weather' + (city ? '?city=' + encodeURIComponent(city) : ''));
+  return await res.json();
+}
+
 async function loadWeather() {
-  const saved = localStorage.getItem('weather-city') || '';
   try {
-    const res = await fetch('/api/weather' + (saved ? '?city=' + encodeURIComponent(saved) : ''));
-    const data = await res.json();
+    const data = await fetchWeather(savedCity());
     if (data.ok) {
       let txt = (data.temperature != null ? data.temperature + '°C' : '--') + ' / ' + (data.humidity != null ? data.humidity + '%' : '--');
-      if (data.wind != null) txt += ' / ' + data.wind + 'm·s⁻¹';
+      if (data.wind != null) txt += ' / ' + data.wind + 'm/s';
       $('#statWeatherLabel').textContent = '今日天气 · ' + (data.city || '本地');
       $('#statWeather').textContent = txt;
-      $('#statWeather').title = '点击更改地区';
+      $('#statWeather').title = '点击查看天气详情';
       $('#statWeather').style.cursor = 'pointer';
     } else {
       $('#statWeather').textContent = '—';
@@ -354,13 +359,148 @@ async function loadWeather() {
   } catch (e) { $('#statWeather').textContent = '—'; }
 }
 
-function changeWeatherCity() {
-  const cur = localStorage.getItem('weather-city') || '';
-  const city = prompt('请输入你所在的城市（如：北京、上海、成都、哈尔滨）：', cur);
-  if (city === null) return;
-  if (city.trim()) localStorage.setItem('weather-city', city.trim());
+// 天气弹窗：搜索城市 + 详细数据 + 24 小时曲线 + 3 天预报
+async function openWeather() {
+  $('#weatherModal').classList.add('show');
+  $('#weatherCity').value = savedCity();
+  $('#weatherBody').innerHTML = '加载中…';
+  const data = await fetchWeather(savedCity());
+  renderWeather(data);
+}
+
+async function searchWeather() {
+  const city = ($('#weatherCity').value || '').trim();
+  if (city) localStorage.setItem('weather-city', city);
   else localStorage.removeItem('weather-city');
+  $('#weatherBody').innerHTML = '加载中…';
+  const data = await fetchWeather(city);
+  renderWeather(data);
   loadWeather();
+}
+
+function renderWeather(w) {
+  const box = $('#weatherBody');
+  if (!w || !w.ok) {
+    box.innerHTML = '<div class="empty">' + escapeHtml((w && w.error) || '天气获取失败') + '</div>';
+    return;
+  }
+  const items = [
+    ['天气', w.desc || '—'],
+    ['气温', w.temperature != null ? w.temperature + '°C' : '—'],
+    ['体感温度', w.apparent != null ? w.apparent + '°C' : '—'],
+    ['相对湿度', w.humidity != null ? w.humidity + '%' : '—'],
+    ['风向风速', (w.windDir || '—') + ' ' + (w.wind != null ? w.wind + ' m/s' : '—')],
+    ['阵风', w.gust != null ? w.gust + ' m/s' : '—'],
+    ['降水量', w.precipitation != null ? w.precipitation + ' mm' : '—'],
+    ['云量', w.cloud != null ? w.cloud + '%' : '—'],
+    ['气压', w.pressure != null ? Math.round(w.pressure) + ' hPa' : '—']
+  ];
+  const risk = (w.risks && w.risks.length)
+    ? '<div class="weather-risk">⚠ 需要防范：' + escapeHtml(w.risks.join('、')) + '</div>' : '';
+  let html = '<div class="weather-title">' + escapeHtml(w.city || '') + ' · ' + escapeHtml(w.desc || '') + '</div>' + risk +
+    '<div class="weather-grid">' + items.map(([k, v]) =>
+      '<div class="weather-item"><span>' + k + '</span><b>' + escapeHtml(String(v)) + '</b></div>').join('') + '</div>';
+
+  // 空气质量（PM2.5 雾霾等）
+  if (w.air) {
+    const a = w.air;
+    const aqiTxt = a.aqi != null ? a.aqi + '（' + (a.level || '') + '）' : '—';
+    const rows = [
+      ['AQI', aqiTxt],
+      ['PM2.5（雾霾）', a.pm25 != null ? a.pm25 + ' μg/m³' : '—'],
+      ['PM10', a.pm10 != null ? a.pm10 + ' μg/m³' : '—'],
+      ['一氧化碳 CO', a.co != null ? a.co + ' μg/m³' : '—'],
+      ['二氧化氮 NO₂', a.no2 != null ? a.no2 + ' μg/m³' : '—'],
+      ['二氧化硫 SO₂', a.so2 != null ? a.so2 + ' μg/m³' : '—'],
+      ['臭氧 O₃', a.o3 != null ? a.o3 + ' μg/m³' : '—']
+    ];
+    html += '<div class="weather-chart-title">空气质量</div><div class="weather-grid">' +
+      rows.map(([k, v]) => '<div class="weather-item"><span>' + k + '</span><b>' + escapeHtml(String(v)) + '</b></div>').join('') + '</div>';
+  }
+
+  // 本场传感器实测（CO₂、氨气）
+  if (w.farm && (w.farm.co2 != null || w.farm.ammonia != null)) {
+    const rows = [
+      ['二氧化碳 CO₂', w.farm.co2 != null ? w.farm.co2 + ' ppm' : '—'],
+      ['氨气 NH₃', w.farm.ammonia != null ? w.farm.ammonia + ' ppm' : '—'],
+      ['在线设备', (w.farm.devices || 0) + ' 台']
+    ];
+    html += '<div class="weather-chart-title">本场传感器实测</div><div class="weather-grid">' +
+      rows.map(([k, v]) => '<div class="weather-item"><span>' + k + '</span><b>' + escapeHtml(String(v)) + '</b></div>').join('') + '</div>';
+  } else {
+    html += '<div class="weather-chart-title">本场传感器实测</div>' +
+      '<div class="empty-hint">暂无设备上报 CO₂ / 氨气，接入 ESP32 后自动显示</div>';
+  }
+
+  if (w.hourly && w.hourly.length) {
+    html += '<div class="weather-chart-title">未来 24 小时温度 / 湿度走势</div>' +
+      '<canvas id="weatherChart" width="720" height="220"></canvas>';
+  }
+  if (w.daily && w.daily.length) {
+    html += '<div class="weather-chart-title">未来 3 天</div><div class="weather-daily">' +
+      w.daily.map((d) => '<div class="weather-day"><div class="wd-date">' + escapeHtml(d.date || '') + '</div>' +
+        '<div class="wd-desc">' + escapeHtml(d.desc || '') + '</div>' +
+        '<div class="wd-temp"><b>' + (d.max != null ? d.max + '°' : '—') + '</b> / ' + (d.min != null ? d.min + '°' : '—') + '</div>' +
+        '<div class="wd-sub">降水 ' + (d.precip != null ? d.precip : 0) + 'mm · 风 ' + (d.wind != null ? d.wind : 0) + 'm/s</div>' +
+        '</div>').join('') + '</div>';
+  }
+  box.innerHTML = html;
+  if (w.hourly && w.hourly.length) drawWeatherChart(w.hourly);
+}
+
+// 24 小时温度/湿度折线
+function drawWeatherChart(hourly) {
+  const cv = document.getElementById('weatherChart');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const padL = 44, padR = 44, padT = 24, padB = 30;
+  ctx.clearRect(0, 0, W, H);
+
+  const temps = hourly.map((h) => Number(h.temperature));
+  const hums = hourly.map((h) => Number(h.humidity));
+  const tMin = Math.min.apply(null, temps);
+  const tMax = Math.max.apply(null, temps);
+  const tRange = (tMax - tMin) || 1;
+  const n = hourly.length;
+  const x = (i) => padL + (i / (n - 1)) * (W - padL - padR);
+  const yT = (v) => padT + (1 - (v - tMin) / tRange) * (H - padT - padB);
+  const yH = (v) => padT + (1 - v / 100) * (H - padT - padB);
+
+  ctx.strokeStyle = '#ecdfc9';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (i / 4) * (H - padT - padB);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(W - padR, y);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = '#e0762e';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  temps.forEach((v, i) => { const px = x(i), py = yT(v); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+  ctx.stroke();
+
+  ctx.strokeStyle = '#2f6fd0';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  hums.forEach((v, i) => { const px = x(i), py = yH(v); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = '#8a7a66';
+  ctx.font = '11px sans-serif';
+  for (let i = 0; i < n; i += 4) {
+    const t = hourly[i] && hourly[i].time ? hourly[i].time : '';
+    ctx.fillText(t, x(i) - 12, H - 8);
+  }
+  ctx.fillStyle = '#e0762e';
+  ctx.fillText('温度 ' + tMax + '° ~ ' + tMin + '°', padL, 14);
+  ctx.fillStyle = '#2f6fd0';
+  ctx.fillText('湿度（虚线）', W - padR - 80, 14);
 }
 
 // 数据分析
@@ -678,8 +818,6 @@ function openAddModal() {
   $('#dmArea').value = '';
   $('#dmStage').value = '';
   $('#dmWeight').value = '';
-  $('#dmFeedCap').value = '';
-  $('#dmFeedAmt').value = '';
   $('#deviceModal').classList.add('show');
 }
 
@@ -695,8 +833,6 @@ function openEditModal(id) {
   $('#dmArea').value = (d.meta && d.meta.area) || '';
   $('#dmStage').value = (d.meta && d.meta.stage) || '';
   $('#dmWeight').value = (d.meta && d.meta.weight) || '';
-  $('#dmFeedCap').value = (d.meta && d.meta.feed_capacity) || '';
-  $('#dmFeedAmt').value = (d.meta && d.meta.feed_amount) || '';
   $('#deviceModal').classList.add('show');
 }
 
@@ -710,8 +846,6 @@ async function saveDevice() {
     area: Number($('#dmArea').value) || 0,
     stage: $('#dmStage').value,
     weight: Number($('#dmWeight').value) || 0,
-    feed_capacity: Number($('#dmFeedCap').value) || 0,
-    feed_amount: Number($('#dmFeedAmt').value) || 0
   };
   try {
     await fetch('/api/devices/' + encodeURIComponent(id) + '/meta', {
@@ -1058,7 +1192,7 @@ async function loadRealKb() {
     }
     // AI 查询记录（每次诊断/预警时的真实环境快照）
     if (data.queries && data.queries.length) {
-      html += '<div class="rk-records-title">AI 查询记录（含当时环境）</div><div class="rk-queries">' +
+      html += '<div class="rk-records-title">AI 查询记录（含当时环境与诊断内容）</div><div class="rk-queries">' +
         data.queries.slice(0, 20).map((q) => {
           const e = q.env || {};
           const env = [];
@@ -1066,13 +1200,23 @@ async function loadRealKb() {
           if (e.humidity !== undefined) env.push('湿度 ' + e.humidity + '%');
           if (e.co2 !== undefined) env.push('CO2 ' + e.co2 + 'ppm');
           if (e.ammonia !== undefined) env.push('氨气 ' + e.ammonia + 'ppm');
+          const ans = String(q.answer || '');
+          const short = ans.slice(0, 160);
+          const answerHtml = ans
+            ? '<div class="rk-answer">' +
+              '<span class="rk-answer-short">答：' + escapeHtml(short) + (ans.length > 160 ? '…' : '') + '</span>' +
+              '<span class="rk-answer-full" style="display:none">答：' + escapeHtml(ans) + '</span>' +
+              (ans.length > 160 ? '<button class="rk-more" type="button">展开全文</button>' : '') +
+              '</div>'
+            : '';
           return '<div class="rk-record"><div class="rk-rec-head"><b>' +
             escapeHtml(q.species || q.deviceName || '查询') + '</b>' +
             (q.stage ? ' · ' + escapeHtml(q.stage) : '') +
             '<span class="rk-q-time">' + escapeHtml(String(q.time || '').replace('T', ' ').slice(0, 16)) + '</span>' +
             '<button class="rk-del" type="button" data-qdel="' + escapeHtml(q.id) + '">删除</button></div>' +
-            '<div class="rk-rec-sub">问：' + escapeHtml(String(q.question || '').slice(0, 60)) + '</div>' +
-            '<div class="rk-rec-env">' + (env.join(' · ') || '无环境数据') + '</div></div>';
+            '<div class="rk-rec-sub">问：' + escapeHtml(String(q.question || '').slice(0, 80)) + '</div>' +
+            '<div class="rk-rec-env">' + (env.join(' · ') || '无环境数据') + '</div>' +
+            answerHtml + '</div>';
         }).join('') + '</div>';
     }
     if (data.records && data.records.length) {
@@ -1106,6 +1250,21 @@ async function loadRealKb() {
           if (!j.ok) { toast(j.error || '删除失败'); return; }
           loadRealKb();
         } catch (err) { toast('删除失败：' + err.message); }
+      });
+    });
+    // 展开 / 收起完整回答
+    box.querySelectorAll('.rk-more').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const rec = btn.closest('.rk-record');
+        if (!rec) return;
+        const shortEl = rec.querySelector('.rk-answer-short');
+        const fullEl = rec.querySelector('.rk-answer-full');
+        if (!shortEl || !fullEl) return;
+        const showingFull = fullEl.style.display !== 'none';
+        fullEl.style.display = showingFull ? 'none' : 'block';
+        shortEl.style.display = showingFull ? 'block' : 'none';
+        btn.textContent = showingFull ? '展开全文' : '收起';
       });
     });
   } catch (e) { box.textContent = '网络错误：' + e.message; }
@@ -1158,7 +1317,8 @@ async function loadWarnings() {
         '<div class="warning-item-main"><div class="warning-item-dev">' + escapeHtml(dev) + '</div>' +
         '<div class="warning-item-time">' + escapeHtml(time) + '</div></div>' +
         '<button class="warning-del" type="button" data-del="' + escapeHtml(f) + '">删除</button></div>';
-    }).join('') + '</div><div class="warning-view" id="warningView"></div>';
+    }).join('') + '</div>' +
+      '<div class="warning-view" id="warningView"><div class="empty-hint">点击左侧记录查看全文</div></div>';
     box.querySelectorAll('[data-file]').forEach((el) => {
       el.addEventListener('click', (e) => {
         if (e.target.closest('[data-del]')) return;
@@ -1198,11 +1358,16 @@ function bindWarningAdd() {
 async function openWarningFile(name) {
   const view = $('#warningView');
   view.textContent = '加载中…';
+  // 高亮当前选中的记录
+  document.querySelectorAll('.warning-item').forEach((el) => {
+    el.classList.toggle('active', el.getAttribute('data-file') === name);
+  });
   try {
     const res = await fetch('/api/warnings/file?name=' + encodeURIComponent(name));
     const data = await res.json();
     if (!data.ok) { view.textContent = data.error || '读取失败'; return; }
     view.innerHTML = '<pre class="warning-pre">' + escapeHtml(data.content) + '</pre>';
+    view.scrollTop = 0;
   } catch (e) { view.textContent = '网络错误：' + e.message; }
 }
 
@@ -1327,50 +1492,6 @@ async function doLogin() {
 // 设备详情 + 摄像头
 let detailTimer = null, recogTimer = null, currentDetailId = null;
 
-// 饲料槽卡片（饲料量由用户填写，可随时修改）
-function renderFeedCard(d) {
-  const meta = d.meta || {};
-  let fl = null;
-  if (Number(meta.feed_capacity) > 0) {
-    fl = Math.round((Number(meta.feed_amount) || 0) / Number(meta.feed_capacity) * 100);
-  } else if (d.metrics && d.metrics.feed_level) {
-    fl = Math.round(Number(d.metrics.feed_level.value));
-  }
-  const fw = Number(meta.feed_amount) || (d.metrics && d.metrics.feed_weight ? Number(d.metrics.feed_weight.value) : null);
-  const cap = Number(meta.feed_capacity) || 0;
-  const st = fl != null ? feedStatus(fl) : '未填写';
-  const cls = fl == null ? '' : (fl < 20 ? 'danger' : fl < 60 ? 'warn' : 'ok');
-  const box = $('#detailExtra');
-  box.innerHTML = '<div class="feed-card"><div class="feed-title">饲料槽状况</div>' +
-    '<div class="feed-row"><span>余量</span><b>' + (fl != null ? fl + '%' : '—') + '</b></div>' +
-    '<div class="feed-row"><span>当前饲料</span><b>' + (fw != null ? fw + ' kg' : '—') + '</b></div>' +
-    '<div class="feed-row"><span>槽容量</span><b>' + (cap > 0 ? cap + ' kg' : '—') + '</b></div>' +
-    '<div class="feed-row"><span>状况</span><b class="feed-status ' + cls + '">' + st + '</b></div>' +
-    '<button class="feed-edit" type="button">修改饲料量</button></div>';
-  const btn = box.querySelector('.feed-edit');
-  if (btn) btn.addEventListener('click', () => updateFeedAmount(d.id));
-}
-
-async function updateFeedAmount(deviceId) {
-  const d = devices.get(deviceId);
-  if (!d) return;
-  const cur = Number(d.meta && d.meta.feed_amount) || 0;
-  const val = prompt('输入当前饲料量（kg）：', cur);
-  if (val === null) return;
-  const num = Number(val);
-  if (!isFinite(num) || num < 0) { toast('请输入有效数字'); return; }
-  try {
-    await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/meta', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ feed_amount: num })
-    });
-    await loadDevices();
-    const nd = devices.get(deviceId);
-    if (nd) renderFeedCard(nd);
-    toast('饲料量已更新');
-  } catch (e) { toast('更新失败：' + e.message); }
-}
 
 function openDetail(id) {
   const d = devices.get(id);
@@ -1414,7 +1535,6 @@ function openDetail(id) {
   $('#detailMetrics').querySelectorAll('[data-metric]').forEach((el) => {
     el.addEventListener('click', () => openMetricChart(id, el.getAttribute('data-metric')));
   });
-  renderFeedCard(d);
 
   $('#camImg').style.display = 'none';
   $('#camPlaceholder').style.display = 'block';
@@ -1486,29 +1606,95 @@ function startCameraRefresh(id) {
   detailTimer = setInterval(refresh, 1500);
 }
 
+// AI 预警的工作状态（分步展示，避免干等）
+const WARN_STEPS = ['读取设备实时数据', '检索本地知识库', '结合当地天气', 'AI 综合研判', '生成预警结论'];
+let warnStepTimer = null;
+let warnStepIdx = 0;
+
+function renderWarnSteps(box, idx) {
+  box.className = 'recog-result loading';
+  const pct = Math.round(((idx + 1) / WARN_STEPS.length) * 100);
+  box.innerHTML = '<div class="recog-head">AI 健康预警分析 · 进行中</div>' +
+    '<div class="warn-progress"><div class="warn-progress-bar" style="width:' + pct + '%"></div></div>' +
+    '<div class="warn-steps">' + WARN_STEPS.map((s, k) =>
+      '<div class="warn-step ' + (k === idx ? 'active' : k < idx ? 'done' : '') + '">' +
+      '<span class="ws-dot"></span><span>' + s + '</span></div>').join('') + '</div>' +
+    '<div class="recog-time">正在分析，请稍候…（通常 10~30 秒）</div>';
+}
+
+function openRecogModal() {
+  const src = $('#recogResult');
+  const body = $('#recogModalBody');
+  body.innerHTML = src.innerHTML;
+  const zb = body.querySelector('.recog-zoom');
+  if (zb) zb.remove();
+  $('#recogModal').classList.add('show');
+}
+
+function startWarnSteps(box) {
+  warnStepIdx = 0;
+  if (warnStepTimer) clearInterval(warnStepTimer);
+  renderWarnSteps(box, 0);
+  warnStepTimer = setInterval(() => {
+    if (warnStepIdx < WARN_STEPS.length - 1) {
+      warnStepIdx++;
+      renderWarnSteps(box, warnStepIdx);
+    }
+  }, 2500);
+}
+
+function stopWarnSteps() {
+  if (warnStepTimer) { clearInterval(warnStepTimer); warnStepTimer = null; }
+}
+
 function startRecognition(id) {
+  let running = false;
   const run = async () => {
+    if (running) return;
+    running = true;
     const box = $('#recogResult');
-    box.className = 'recog-result';
-    box.textContent = '正在结合个体状态、环境数据与知识库分析…';
+    // 已有结果时不覆盖，只在角落提示「更新中」，避免把正在看的内容刷掉
+    const hasResult = !!box.querySelector('.recog-head') && !box.classList.contains('loading');
+    if (hasResult) {
+      let tag = box.querySelector('.recog-updating');
+      if (!tag) {
+        tag = document.createElement('div');
+        tag.className = 'recog-updating';
+        tag.textContent = '更新中…';
+        box.appendChild(tag);
+      }
+    } else {
+      startWarnSteps(box);
+    }
     try {
       const res = await fetch('/api/health/' + encodeURIComponent(id), { method: 'POST' });
       const data = await res.json();
+      stopWarnSteps();
       if (data.ok) {
-        const warn = /高风险|中风险|异常|生病|危险|病|死亡|静止|不动|未移动/.test(data.result || '');
+        const warn = /高风险|中风险|异常|生病|危险|死亡|长时间静止|未移动/.test(data.result || '');
         box.className = 'recog-result' + (warn ? ' warn' : '');
-        box.innerHTML = '<div class="recog-head">AI 健康预警分析</div>' + renderMarkdown(data.result || '') + '<div class="recog-time">' + new Date().toLocaleTimeString() + '</div>';
+        box.innerHTML = '<div class="recog-head"><span>AI 健康预警分析</span><button class="recog-zoom" type="button">⛶ 放大</button></div>' +
+          renderMarkdown(data.result || '') + '<div class="recog-time">' + new Date().toLocaleTimeString() + '</div>';
+        const zb = box.querySelector('.recog-zoom');
+        if (zb) zb.addEventListener('click', openRecogModal);
       } else {
-        box.className = 'recog-result';
-        box.textContent = data.error || data.result || '分析失败';
+        if (!hasResult) {
+          box.className = 'recog-result';
+          box.textContent = data.error || data.result || '分析失败';
+        }
       }
     } catch (e) {
-      box.className = 'recog-result';
-      box.textContent = '分析请求失败：' + e.message;
+      stopWarnSteps();
+      if (!hasResult) {
+        box.className = 'recog-result';
+        box.textContent = '分析请求失败：' + e.message;
+      }
     }
+    running = false;
   };
   run();
-  recogTimer = setInterval(run, 60000);
+  // 5 分钟刷新一次（原来 60 秒太快，会打断阅读）
+  recogTimer = setInterval(run, 300000);
 }
 
 // 初始化
@@ -1610,8 +1796,22 @@ document.addEventListener('DOMContentLoaded', () => {
   [$('#marketModal'), $('#realKbModal')].forEach((m) => {
     m.addEventListener('click', (e) => { if (e.target === m) m.classList.remove('show'); });
   });
+  // 放大 / 还原
+  $('#realKbExpand').addEventListener('click', () => {
+    const p = $('#realKbPanel');
+    p.classList.toggle('expanded');
+    $('#realKbExpand').textContent = p.classList.contains('expanded') ? '⛶ 还原' : '⛶ 放大';
+  });
+  $('#warningExpand').addEventListener('click', () => {
+    const p = $('#warningPanel');
+    p.classList.toggle('expanded');
+    $('#warningExpand').textContent = p.classList.contains('expanded') ? '⛶ 还原' : '⛶ 放大';
+  });
   $('#chartClose').addEventListener('click', () => $('#chartModal').classList.remove('show'));
   $('#chartModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('show'); });
+  // AI 预警放大弹窗
+  $('#recogModalClose').addEventListener('click', () => $('#recogModal').classList.remove('show'));
+  $('#recogModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('show'); });
   // 预警记录
   $('#btnWarnings').addEventListener('click', loadWarnings);
   $('#warningClose').addEventListener('click', () => $('#warningModal').classList.remove('show'));
@@ -1621,9 +1821,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#analysisModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('show'); });
   // 数据诊断分析每 10 分钟自动刷新
   setInterval(loadAnalysis, 600000);
-  // 点击天气可更改地区
-  $('#statWeather').addEventListener('click', changeWeatherCity);
-  $('#statWeatherLabel').addEventListener('click', changeWeatherCity);
+  // 点击天气打开详情弹窗（可搜索城市）
+  $('#statWeather').addEventListener('click', openWeather);
+  $('#statWeatherLabel').addEventListener('click', openWeather);
+  $('#weatherClose').addEventListener('click', () => $('#weatherModal').classList.remove('show'));
+  $('#weatherModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('show'); });
+  $('#weatherSearch').addEventListener('click', searchWeather);
+  $('#weatherCity').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchWeather(); });
 });
 
 async function loadConfig() {

@@ -271,6 +271,83 @@ function archiveConversation(id) {
   return count;
 }
 
+// ───── 扣子知识库同步：把当天的新记录整理成文档推到扣子 ─────
+async function uploadKbDocument(name, text, separator) {
+  const kb = config.knowledgeBase || {};
+  if (!kb.dataset_id) throw new Error('未配置知识库 ID');
+  const b64 = Buffer.from(text, 'utf8').toString('base64');
+  // 有分隔符时按分隔符切段（每条记录一段，检索更准），否则自动分段
+  const chunkStrategy = separator
+    ? { chunk_type: 1, separator, max_tokens: 800, remove_extra_spaces: false, remove_urls_emails: false }
+    : { chunk_type: 0 };
+  const resp = await fetch('https://api.coze.cn/open_api/knowledge/document/create', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + (AGENT.apiKey || ''),
+      'Content-Type': 'application/json',
+      'Agw-Js-Conv': 'str'          // 不加这个头会返回 400
+    },
+    body: JSON.stringify({
+      dataset_id: String(kb.dataset_id),
+      document_bases: [{ name, source_info: { file_base64: b64, file_type: 'txt' } }],
+      chunk_strategy: chunkStrategy
+    })
+  });
+  const data = await resp.json();
+  if (!data || data.code !== 0) throw new Error((data && data.msg) || '上传失败');
+  return (data.document_infos && data.document_infos[0]) || null;
+}
+
+let kbSyncedDate = '';
+let kbSyncing = false;
+async function syncKnowledgeBase() {
+  const kb = config.knowledgeBase || {};
+  if (!kb.dataset_id || !kb.auto) return 0;
+  if (kbSyncing) return 0;          // 防止并发重复上传
+  const today = new Date().toISOString().slice(0, 10);
+  if (kbSyncedDate === today) return 0;
+  const recs = queryRecords.filter((r) => String(r.time || '').startsWith(today));
+  if (!recs.length) return 0;
+
+  kbSyncing = true;
+  try {
+    const lines = ['# 养殖场病例记录 ' + today, ''];
+    // 目录：方便检索时定位
+    lines.push('## 记录目录');
+    recs.forEach((r, i) => {
+      lines.push((i + 1) + '. ' + (r.time || '') + ' ' + (r.species || '') +
+        (r.stage ? '（' + r.stage + '）' : '') + ' ' + (r.deviceName || ''));
+    });
+    lines.push('');
+
+    // 每条记录用 ===== 分隔（上传时按这个切段，检索更精准）
+    recs.forEach((r, i) => {
+      const e = r.env || {};
+      const env = [];
+      if (e.temperature !== undefined) env.push('温度 ' + e.temperature + '°C');
+      if (e.humidity !== undefined) env.push('湿度 ' + e.humidity + '%');
+      if (e.co2 !== undefined) env.push('CO2 ' + e.co2 + 'ppm');
+      if (e.ammonia !== undefined) env.push('氨气 ' + e.ammonia + 'ppm');
+      lines.push('=====');
+      lines.push('## 记录 ' + (i + 1));
+      lines.push('时间：' + (r.time || ''));
+      lines.push('物种：' + (r.species || '未填写') + (r.stage ? '（' + r.stage + '）' : ''));
+      lines.push('设备：' + (r.deviceName || '未填写'));
+      lines.push('环境：' + (env.join('，') || '无环境数据'));
+      lines.push('问题：' + (r.question || ''));
+      lines.push('结论：' + (r.answer || ''));
+      lines.push('');
+    });
+
+    await uploadKbDocument('病例_' + today + '.txt', lines.join('\n'), '=====');
+    kbSyncedDate = today;
+    console.log('[知识库] 已同步 ' + recs.length + ' 条记录到扣子');
+    return recs.length;
+  } finally {
+    kbSyncing = false;
+  }
+}
+
 function recordIllness(body) {
   const b = body || {};
   const deviceId = String(b.deviceId || '').trim();
@@ -361,7 +438,42 @@ function buildRealKnowledge() {
   };
 }
 
-function buildRealKnowledgeContext() {
+// 按问题关键词挑相关历史记录（物种 / 设备 / 日期），保证问到什么就带什么
+function pickRelevantQueries(message, limit) {
+  const text = String(message || '');
+  const all = queryRecords.slice().reverse();          // 最近的在前
+  if (!all.length) return [];
+
+  const speciesHit = SPECIES.filter((s) => s.name && text.includes(s.name)).map((s) => s.name);
+  const deviceHit = [...devices.values()]
+    .filter((d) => d.name && d.name.length >= 2 && text.includes(d.name))
+    .map((d) => d.name);
+
+  // 日期：2026-11-02 或 11月2日 / 11-02
+  const dates = [];
+  let m;
+  const re1 = /(\d{4})-(\d{1,2})-(\d{1,2})/g;
+  while ((m = re1.exec(text))) dates.push(m[1] + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0'));
+  const re2 = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
+  while ((m = re2.exec(text))) dates.push('-MM-' + String(m[1]).padStart(2, '0') + '-' + String(m[2]).padStart(2, '0'));
+
+  const matched = all.filter((r) => {
+    if (speciesHit.length && !speciesHit.includes(r.species)) return false;
+    if (deviceHit.length && !deviceHit.includes(r.deviceName)) return false;
+    if (dates.length) {
+      const t = String(r.time || '');
+      const ok = dates.some((d) => (d.startsWith('-MM-') ? t.slice(5, 10) === d.slice(4) : t.startsWith(d)));
+      if (!ok) return false;
+    }
+    return true;
+  });
+
+  // 命中就用命中的，没命中退回最近的
+  const list = matched.length ? matched : all;
+  return list.slice(0, limit || 8);
+}
+
+function buildRealKnowledgeContext(message) {
   const rk = buildRealKnowledge();
   const lines = [];
   for (const p of rk.parameters.slice(0, 8)) {
@@ -377,8 +489,9 @@ function buildRealKnowledgeContext() {
       '；' + (env.join('，') || '无环境数据'));
   }
   if (rk.queries && rk.queries.length) {
-    lines.push('· 近期查询记录（含当时的真实环境）：');
-    for (const q of rk.queries.slice(0, 6)) {
+    const picked = pickRelevantQueries(message, 8);
+    lines.push('· 相关历史查询记录（含当时的真实环境）：');
+    for (const q of picked) {
       const e = q.env || {};
       const env = [];
       if (e.temperature !== undefined) env.push('温度 ' + e.temperature + '°C');
@@ -389,7 +502,8 @@ function buildRealKnowledgeContext() {
       lines.push('  - ' + String(q.time || '').slice(0, 16).replace('T', ' ') +
         ' ' + who + (q.stage ? '（' + q.stage + '）' : '') +
         '：' + (env.join('，') || '无环境数据') +
-        '；问题：' + String(q.question || '').slice(0, 60));
+        '；问题：' + String(q.question || '').slice(0, 60) +
+        '；结论：' + String(q.answer || '').replace(/\s+/g, ' ').slice(0, 120));
     }
   }
   if (!lines.length) return '';
@@ -481,6 +595,9 @@ function buildHealthPrompt(device) {
   if (latest.ammonia !== undefined) env.push('氨气 ' + latest.ammonia + 'ppm');
   if (latest.light !== undefined) env.push('光照 ' + latest.light + '%');
   if (latest.camera_count !== undefined) env.push('摄像头识别数量 ' + latest.camera_count + ' 只');
+  if (device.meta && device.meta.camera_status) {
+    env.push('画面识别：' + String(device.meta.camera_status).replace(/\s+/g, ' ').slice(0, 140));
+  }
   const dinfo = densityInfo(device);
   if (dinfo.actual != null) env.push('种群密度 ' + dinfo.actual + ' 只/㎡');
 
@@ -492,14 +609,31 @@ function buildHealthPrompt(device) {
   const diseases = ((sp && sp.diseases) || [])
     .map((d) => '- ' + d.name + '：症状 ' + d.symptoms + '；诱因 ' + d.factors)
     .join('\n');
-  const real = buildRealKnowledgeContext();
+  const real = buildRealKnowledgeContext('');
+
+  // 画面识别状态：成功识别则结合画面，未识别则明确告知用户后仅用数据判断
+  const camStatus = (device.meta && device.meta.camera_status) || '';
+  const camCount = latest.camera_count;
+  const camOk = !!(camStatus || camCount !== undefined);
+  const camBlock = camOk
+    ? '【画面识别（已获取到特征）】\n' +
+      (camCount !== undefined
+        ? '画面中识别到动物数量：' + camCount + ' 只\n'
+        : '画面中动物数量：未识别（画面不清晰，不要猜测或编造具体数字）\n') +
+      (camStatus ? String(camStatus).replace(/\s+/g, ' ').slice(0, 300) : '') +
+      '\n· 请把画面中的活动状态、异常表现与环境数据结合判断；数量未识别时不要写具体只数。'
+    : '【画面识别】\n未检测到物体或物体状况（摄像头无画面或未完成识别）。\n' +
+      '· 请在结论开头明确写出「因未检测到物体状况，本次判断仅基于环境数据、历史记录与通用知识」，然后再给出后续预警。';
 
   return [
-    '【任务】你是养殖场智能预警助手。本系统的核心优势是实时环境监测，请【首先】基于下面的实时环境数据（尤其是超标项）分析病因与风险，再结合本场历史记录与物种通用知识。',
+    '【任务】你是养殖场智能预警助手。本系统的核心优势是实时环境监测，请【首先】基于下面的实时环境数据（尤其是超标项）分析病因与风险，再结合画面识别、本场历史记录与物种通用知识。',
+    '画面识别结果必须作为判断依据之一：识别到动物时，必须说明画面中的数量与活动状态；未识别到时，必须说明这一点后再给出判断。',
     '',
     '【实时环境数据（核心依据，优先分析）】',
     env.join('，') || '暂无数据',
     '【指标偏离情况】' + anomalyText,
+    '',
+    camBlock,
     '',
     real || '【本场真实知识库】暂无历史记录。',
     '',
@@ -516,7 +650,7 @@ function buildHealthPrompt(device) {
     '【判断规则】1. 优先分析环境超标项与疾病的因果关系，这是本系统最可靠的依据；2. 其次参考本场历史记录；3. 最后参考通用知识。冲突时说明差异。',
     '',
     '【输出要求】请务必详细、分点展开，不要只写一两句。',
-    '一、总体风险判断：给出风险等级（低/中/高），并明确指出是由哪几项环境指标驱动的。',
+    '一、总体风险判断：给出风险等级（低/中/高），明确指出由哪几项环境指标驱动，并说明画面识别结果（动物数量、活动状态）是否支持该判断；若未识别到画面，先说明「因未检测到物体状况，本次判断仅基于环境数据与历史记录」。',
     '二、可能疾病清单：按可能性从高到低排列，每种疾病给出：可能性（百分比）、判断依据（重点写环境数据、成长阶段、体重、病前征兆）。',
     '三、防治方案：针对每种疾病，分三个阶段详细给出：',
     '  【病前预防】环境管理（温湿度/通风/密度/光照）、免疫程序、消毒制度、饲料营养、日常观察要点；',
@@ -689,14 +823,16 @@ function upsertDevice(deviceId, name, body, ip) {
     if (body.area != null && !isNaN(Number(body.area))) device.meta.area = Number(body.area);
     if (body.stage != null && String(body.stage).trim()) device.meta.stage = String(body.stage).trim();
     if (body.weight != null && !isNaN(Number(body.weight))) device.meta.weight = Number(body.weight);
-    if (body.feed_capacity != null && !isNaN(Number(body.feed_capacity))) device.meta.feed_capacity = Number(body.feed_capacity);
-    if (body.feed_amount != null && !isNaN(Number(body.feed_amount))) device.meta.feed_amount = Number(body.feed_amount);
     if (body.local_ip != null && String(body.local_ip).trim()) device.meta.local_ip = String(body.local_ip).trim();
     if (body.stream_port != null) device.meta.stream_port = Number(body.stream_port) || 81;
   }
 
   const metrics = extractMetrics(body);
   const latest = { time: ts, ...metrics };
+  // 摄像头识别数量来自 AI 识别，传感器上报不带这个字段，替换 latest 时保留
+  if (device.latest && device.latest.camera_count !== undefined && latest.camera_count === undefined) {
+    latest.camera_count = device.latest.camera_count;
+  }
 
   device.latest = latest;
   device.history.push(latest);
@@ -782,6 +918,7 @@ function deviceSummary(device) {
     if (k === 'time') continue;
     metrics[k] = { value: v, status: evaluateMetric(k, v), severity: severityOf(k, v, speciesName) };
   }
+
   const online = now() - (device.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     id: device.id,
@@ -798,8 +935,8 @@ function deviceSummary(device) {
       area: (device.meta && device.meta.area) || 0,
       stage: (device.meta && device.meta.stage) || '',
       weight: (device.meta && device.meta.weight) || 0,
-      feed_capacity: (device.meta && device.meta.feed_capacity) || 0,
-      feed_amount: (device.meta && device.meta.feed_amount) || 0,
+      camera_status: (device.meta && device.meta.camera_status) || '',
+      camera_time: (device.meta && device.meta.camera_time) || '',
       local_ip: (device.meta && device.meta.local_ip) || '',
       stream_port: (device.meta && device.meta.stream_port) || 81
     },
@@ -888,6 +1025,197 @@ async function parseJsonBody(req) {
     err.status = 400;
     throw err;
   }
+}
+
+// 天气（Open-Meteo 免费接口）：高低温、湿度、风速风向、阵风、降水、云量、气压、紫外线
+const WMO_DESC = {
+  0: '晴', 1: '晴间多云', 2: '多云', 3: '阴',
+  45: '雾', 48: '雾凇',
+  51: '小毛毛雨', 53: '毛毛雨', 55: '大毛毛雨',
+  56: '冻毛毛雨', 57: '强冻毛毛雨',
+  61: '小雨', 63: '中雨', 65: '大雨',
+  66: '冻雨', 67: '强冻雨',
+  71: '小雪', 73: '中雪', 75: '大雪', 77: '雪粒',
+  80: '小阵雨', 81: '阵雨', 82: '强阵雨',
+  85: '小阵雪', 86: '强阵雪',
+  95: '雷阵雨', 96: '雷阵雨伴冰雹', 99: '强雷暴伴冰雹'
+};
+
+const WIND_DIRS = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+function windDirName(deg) {
+  if (deg === undefined || deg === null) return '';
+  return WIND_DIRS[Math.round(Number(deg) / 45) % 8] + '风';
+}
+
+// 极端天气提示（供数据分析与 AI 预警参考）
+function weatherRisks(w) {
+  const risks = [];
+  const code = Number(w.code);
+  const wind = Number(w.wind) || 0;
+  const temp = Number(w.temperature);
+  if (code >= 95) risks.push('雷暴');
+  if (code >= 80) risks.push('强降水');
+  if (code >= 71 && code <= 77) risks.push('降雪');
+  if (wind >= 10.8) risks.push('大风（可能破坏棚舍）');
+  else if (wind >= 8) risks.push('风力较大');
+  if (!isNaN(temp) && temp <= 0) risks.push('低温冰冻');
+  if (!isNaN(temp) && temp >= 35) risks.push('高温热应激');
+  return risks;
+}
+
+// AQI 等级（US AQI）
+function aqiLevel(v) {
+  if (v === undefined || v === null) return '';
+  const n = Number(v);
+  if (n <= 50) return '优';
+  if (n <= 100) return '良';
+  if (n <= 150) return '轻度污染';
+  if (n <= 200) return '中度污染';
+  if (n <= 300) return '重度污染';
+  return '严重污染';
+}
+
+let weatherCache = { key: '', ts: 0, data: null };
+const WEATHER_TTL = 10 * 60 * 1000;
+
+async function getWeather(cityName) {
+  const key = String(cityName || '').trim() || process.env.WEATHER_CITY || (config.weather && config.weather.city) || '广州';
+  if (weatherCache.key === key && Date.now() - weatherCache.ts < WEATHER_TTL) return weatherCache.data;
+
+  let lat = (config.weather && config.weather.lat) || 23.13;
+  let lon = (config.weather && config.weather.lon) || 113.26;
+  let city = key;
+
+  // 城市名 → 经纬度
+  try {
+    if (key && key !== ((config.weather && config.weather.city) || '')) {
+      const geoUrl = 'https://geocoding-api.open-meteo.com/v1/search?name=' +
+        encodeURIComponent(key) + '&count=1&language=zh&format=json';
+      const geoData = await (await fetch(geoUrl)).json();
+      const hit = geoData.results && geoData.results[0];
+      if (hit) {
+        lat = hit.latitude;
+        lon = hit.longitude;
+        city = hit.name || key;
+      }
+    }
+  } catch (e) { /* 地理编码失败就用默认坐标 */ }
+
+  const u = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon +
+    '&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,cloud_cover,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m' +
+    '&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,wind_speed_10m,pm2_5' +
+    '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,uv_index_max' +
+    '&timezone=Asia%2FShanghai&forecast_days=3';
+  const data = await (await fetch(u)).json();
+  const c = data.current || {};
+
+  // 空气质量：PM2.5 雾霾、PM10、CO、NO2、SO2、O3、AQI
+  let air = null;
+  try {
+    const au = 'https://air-quality-api.open-meteo.com/v1/air-quality?latitude=' + lat + '&longitude=' + lon +
+      '&current=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,us_aqi&timezone=Asia%2FShanghai';
+    const ad = await (await fetch(au)).json();
+    const a = ad.current || {};
+    air = {
+      pm25: a.pm2_5,
+      pm10: a.pm10,
+      co: a.carbon_monoxide,
+      no2: a.nitrogen_dioxide,
+      so2: a.sulphur_dioxide,
+      o3: a.ozone,
+      aqi: a.us_aqi,
+      level: aqiLevel(a.us_aqi)
+    };
+  } catch (e) { air = null; }
+
+  // 本场传感器实测（CO2、氨气等，天气接口不提供）
+  const farm = { co2: null, ammonia: null, temperature: null, humidity: null, devices: 0 };
+  let co2Sum = 0, co2N = 0, nh3Sum = 0, nh3N = 0;
+  for (const d of devices.values()) {
+    if (!d.latest) continue;
+    if (d.latest.co2 !== undefined) { co2Sum += Number(d.latest.co2); co2N++; }
+    if (d.latest.ammonia !== undefined) { nh3Sum += Number(d.latest.ammonia); nh3N++; }
+  }
+  if (co2N) farm.co2 = Math.round(co2Sum / co2N);
+  if (nh3N) farm.ammonia = Math.round((nh3Sum / nh3N) * 10) / 10;
+  farm.devices = devices.size;
+
+  const hourly = [];
+  if (data.hourly && data.hourly.time) {
+    const nowIso = c.time || '';
+    let start = data.hourly.time.findIndex((t) => t >= nowIso);
+    if (start < 0) start = 0;
+    for (let i = start; i < Math.min(start + 24, data.hourly.time.length); i++) {
+      hourly.push({
+        time: String(data.hourly.time[i]).slice(11, 16),
+        temperature: data.hourly.temperature_2m[i],
+        humidity: data.hourly.relative_humidity_2m[i],
+        precipProb: data.hourly.precipitation_probability[i],
+        wind: data.hourly.wind_speed_10m[i],
+        pm25: data.hourly.pm2_5 ? data.hourly.pm2_5[i] : null
+      });
+    }
+  }
+
+  const daily = [];
+  if (data.daily && data.daily.time) {
+    for (let i = 0; i < data.daily.time.length; i++) {
+      daily.push({
+        date: String(data.daily.time[i]).slice(5),
+        code: data.daily.weather_code[i],
+        desc: WMO_DESC[data.daily.weather_code[i]] || '',
+        max: data.daily.temperature_2m_max[i],
+        min: data.daily.temperature_2m_min[i],
+        precip: data.daily.precipitation_sum[i],
+        wind: data.daily.wind_speed_10m_max[i],
+        uv: data.daily.uv_index_max[i]
+      });
+    }
+  }
+
+  const out = {
+    city,
+    lat,
+    lon,
+    code: c.weather_code,
+    desc: WMO_DESC[c.weather_code] || '',
+    temperature: c.temperature_2m,
+    humidity: c.relative_humidity_2m,
+    apparent: c.apparent_temperature,
+    precipitation: c.precipitation,
+    cloud: c.cloud_cover,
+    pressure: c.surface_pressure,
+    wind: c.wind_speed_10m,
+    windDir: windDirName(c.wind_direction_10m),
+    windDirDeg: c.wind_direction_10m,
+    gust: c.wind_gusts_10m,
+    risks: weatherRisks({ code: c.weather_code, wind: c.wind_speed_10m, temperature: c.temperature_2m }),
+    air,
+    farm,
+    hourly,
+    daily,
+    updatedAt: now()
+  };
+  weatherCache = { key, ts: Date.now(), data: out };
+  return out;
+}
+
+// 生成天气摘要文本（给智能体用）
+function buildWeatherContext(w) {
+  if (!w || !w.ok) return '';
+  const parts = [];
+  parts.push('地区 ' + w.city);
+  if (w.desc) parts.push(w.desc);
+  if (w.temperature !== undefined) parts.push('气温 ' + w.temperature + '°C');
+  if (w.apparent !== undefined) parts.push('体感 ' + w.apparent + '°C');
+  if (w.humidity !== undefined) parts.push('湿度 ' + w.humidity + '%');
+  if (w.wind !== undefined) parts.push(w.windDir ? w.windDir + ' ' + w.wind + 'm/s' : '风速 ' + w.wind + 'm/s');
+  if (w.gust !== undefined) parts.push('阵风 ' + w.gust + 'm/s');
+  if (w.precipitation !== undefined) parts.push('降水 ' + w.precipitation + 'mm');
+  if (w.cloud !== undefined) parts.push('云量 ' + w.cloud + '%');
+  if (w.pressure !== undefined) parts.push('气压 ' + w.pressure + 'hPa');
+  if (w.risks && w.risks.length) parts.push('⚠ 需注意：' + w.risks.join('、'));
+  return parts.join('，');
 }
 
 // 路由
@@ -993,8 +1321,6 @@ const server = http.createServer(async (req, res) => {
         if (body.area != null && !isNaN(Number(body.area))) device.meta.area = Number(body.area);
         if (body.stage != null) device.meta.stage = String(body.stage).trim();
         if (body.weight != null && !isNaN(Number(body.weight))) device.meta.weight = Number(body.weight);
-    if (body.feed_capacity != null && !isNaN(Number(body.feed_capacity))) device.meta.feed_capacity = Number(body.feed_capacity);
-    if (body.feed_amount != null && !isNaN(Number(body.feed_amount))) device.meta.feed_amount = Number(body.feed_amount);
         if (body.name != null && String(body.name).trim()) {
           device.name = String(body.name).trim();
           device.meta.nameSet = true;   // 用户自定义名称，ESP32 上报不再覆盖
@@ -1182,47 +1508,25 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // 手动触发：把当天记录同步到扣子知识库
+    if (req.method === 'POST' && pathname === '/api/kb/sync') {
+      try {
+        const n = await syncKnowledgeBase();
+        sendJson(res, 200, { ok: true, synced: n, datasetId: (config.knowledgeBase || {}).dataset_id || '' });
+      } catch (e) {
+        sendJson(res, 500, { ok: false, error: '同步失败：' + e.message });
+      }
+      return;
+    }
+
     // 7.99 今日天气（Open-Meteo 免费接口）
     if (req.method === 'GET' && pathname === '/api/weather') {
       const cityParam = new URL(req.url, 'http://x').searchParams.get('city') || '';
-      let lat = (config.weather && config.weather.lat) || 23.13;
-      let lon = (config.weather && config.weather.lon) || 113.26;
-      let city = process.env.WEATHER_CITY || (config.weather && config.weather.city) || '广州';
       try {
-        if (cityParam) {
-          // 先地理编码城市名
-          const geoUrl = 'https://geocoding-api.open-meteo.com/v1/search?name=' +
-            encodeURIComponent(cityParam) + '&count=1&language=zh&format=json';
-          const geoResp = await fetch(geoUrl);
-          const geoData = await geoResp.json();
-          const hit = geoData.results && geoData.results[0];
-          if (hit) {
-            lat = hit.latitude;
-            lon = hit.longitude;
-            city = hit.name || cityParam;
-          } else {
-            city = cityParam + '（未找到，使用默认地区）';
-          }
-        }
-        const u = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon +
-          '&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,surface_pressure&timezone=Asia%2FShanghai';
-        const resp = await fetch(u);
-        const data = await resp.json();
-        const cur = data.current || {};
-        sendJson(res, 200, {
-          ok: true,
-          city,
-          lat,
-          lon,
-          temperature: cur.temperature_2m,
-          humidity: cur.relative_humidity_2m,
-          wind: cur.wind_speed_10m,
-          pressure: cur.surface_pressure,
-          code: cur.weather_code,
-          updatedAt: now()
-        });
+        const w = await getWeather(cityParam);
+        sendJson(res, 200, Object.assign({ ok: true }, w));
       } catch (e) {
-        sendJson(res, 200, { ok: false, city, error: '天气获取失败：' + e.message });
+        sendJson(res, 200, { ok: false, error: '天气获取失败：' + e.message });
       }
       return;
     }
@@ -1233,7 +1537,15 @@ const server = http.createServer(async (req, res) => {
       const id = decodeURIComponent(healthMatch[1]);
       const dev = devices.get(id);
       if (!dev) { sendJson(res, 404, { ok: false, error: '设备不存在' }); return; }
-      const prompt = buildHealthPrompt(dev);
+      let prompt = buildHealthPrompt(dev);
+      // 结合当地天气作为外部诱因（寒潮导致发烧、大风雷暴损坏棚舍等）
+      try {
+        const w = await getWeather('');
+        if (w) {
+          prompt += '\n\n【当地天气（外部环境参考）】\n' + buildWeatherContext(Object.assign({ ok: true }, w)) +
+            '\n· 请结合天气判断外部诱因：如寒潮/高温应激引发发烧或采食下降、大风雷暴损坏棚舍导致环境骤变、连阴雨导致垫料潮湿诱发球虫等。';
+        }
+      } catch (e) { /* 天气获取失败不影响预警 */ }
       try {
         const reply = await handleCozeChat(prompt, [], []);
         const result = reply.ok ? (reply.reply && reply.reply.content) : (reply.error || '分析失败');
@@ -1414,17 +1726,44 @@ const server = http.createServer(async (req, res) => {
         const images = [];
         if (f.prevBuf) images.push(await uploadToCoze(f.prevBuf, 'frame_prev.jpg'));
         images.push(await uploadToCoze(f.buf, 'frame_now.jpg'));
-        const prompt = '这是养殖监控的连续两帧画面（相隔约1秒）。请严格按以下格式回答：\n第一行只写「数量：X」（X 为画面中动物总数，阿拉伯数字，不要写其他内容）；\n然后识别动物种类（鸡/鸭/鹅/猪/牛/羊等）；\n然后对比两帧判断动物是否移动、移动快慢；\n如有动物长时间静止不动（可能生病、死亡或异常），请明确预警。';
+        const prompt = '这是养殖监控的连续两帧画面（相隔约1秒）。请严格按以下格式回答：\n' +
+          '第一行只写「数量：X」或「数量：未知」。\n' +
+          '· 只有画面清晰、动物轮廓可辨认、能逐个点清时才写具体数字；\n' +
+          '· 如果画面模糊、光线不足、动物被遮挡、距离太远、数量过多难以点清，一律写「数量：未知」，绝对不要猜测或估算；\n' +
+          '第二行写动物种类（看不清就写「种类：未知」）；\n' +
+          '第三行对比两帧判断动物是否移动、移动快慢（无法判断就写「移动：无法判断」）；\n' +
+          '如有动物长时间静止不动（可能生病、死亡或异常），请明确预警。\n' +
+          '注意：宁可写「未知」，也不要给出不确定的数字。';
+
         const reply = await handleCozeChat(prompt, [], images);
         const content = reply.ok ? (reply.reply && reply.reply.content) : (reply.error || '识别失败');
-        // 解析 AI 返回的数量，写入设备（供页面与智能体使用）
+
+        // 只认「数量：」这一行；写「未知/无法判断」就不写数量，其他行的模糊描述不影响
         let detected = null;
-        const dm = String(content || '').match(/(?:数量|总数|共计|共)\s*[:：]?\s*(\d+)/);
-        if (dm) detected = Number(dm[1]);
-        if (detected != null && devices.has(id)) {
+        const text = String(content || '');
+        const cntLine = text.match(/数量\s*[:：]\s*([^\n，。；]{1,20})/);
+        if (cntLine) {
+          const v = cntLine[1].trim();
+          const num = v.match(/^(\d{1,4})/);
+          const unknown = /未知|不明|无法|不清|看不清|难以/.test(v);
+          if (num && !unknown) {
+            const n = Number(num[1]);
+            if (n > 0 && n <= 5000) detected = n;
+          }
+        }
+
+        if (devices.has(id)) {
           const dev = devices.get(id);
           dev.latest = dev.latest || {};
-          dev.latest.camera_count = detected;
+          if (detected != null) {
+            dev.latest.camera_count = detected;
+          } else if (dev.latest.camera_count !== undefined) {
+            delete dev.latest.camera_count;   // 这次没识别出，清掉旧数量，避免误导
+          }
+          // 识别状态（种类/移动/异常）存到 meta，供预警提示词使用
+          dev.meta = dev.meta || {};
+          dev.meta.camera_status = String(content || '').slice(0, 400);
+          dev.meta.camera_time = isoTime(now());
           markDirty();
           broadcast('device-update', deviceSummary(dev));
         }
@@ -1444,14 +1783,33 @@ const server = http.createServer(async (req, res) => {
 
     // 8.5 数据分析（异常识别 + 正常值对比 + 结论）
     if (req.method === 'GET' && pathname === '/api/analysis') {
-      const results = [...devices.values()].map(analyzeDevice);
+      // 当地天气作为外部诱因参考（如大风雷暴损坏棚舍导致环境异常）
+      let w = null;
+      try { w = await getWeather(''); } catch (e) { w = null; }
+      const wBrief = w ? {
+        city: w.city, desc: w.desc, temperature: w.temperature,
+        humidity: w.humidity, wind: w.wind, windDir: w.windDir, risks: w.risks
+      } : null;
+
+      const results = [...devices.values()].map((d) => {
+        const r = analyzeDevice(d);
+        r.weather = wBrief;
+        if (w && w.risks && w.risks.length && r.anomalies.length) {
+          r.weatherNote = '当地天气' + (w.desc || '') + '（' + w.risks.join('、') +
+            '），可能是造成环境异常的外部因素，请检查棚舍结构、排水与通风设施是否受损。';
+          r.conclusion += ' ' + r.weatherNote;
+        } else if (w && w.risks && w.risks.length) {
+          r.weatherNote = '当地天气' + (w.desc || '') + '（' + w.risks.join('、') + '），请提前做好防护。';
+        }
+        return r;
+      });
       const alerts = [];
       for (const r of results) {
         for (const a of r.anomalies) {
           alerts.push({ deviceId: r.id, device: r.name, species: r.species, key: a.key, label: a.label, value: a.value, unit: a.unit, normal: a.normal, status: a.status });
         }
       }
-      sendJson(res, 200, { ok: true, results, alerts, alertCount: alerts.length });
+      sendJson(res, 200, { ok: true, weather: wBrief, results, alerts, alertCount: alerts.length });
       return;
     }
 
@@ -1516,10 +1874,13 @@ function buildEnvironmentContext() {
     if (l.noise !== undefined) parts.push(`噪声 ${l.noise}dB`);
     if (l.o2 !== undefined) parts.push(`氧气 ${l.o2}%`);
     if (l.soil_temp !== undefined) parts.push(`土壤温度 ${l.soil_temp}°C`);
-    if (l.feed_level !== undefined) parts.push(`饲料槽余量 ${l.feed_level}%`);
-    if (l.feed_weight !== undefined) parts.push(`饲料槽重量 ${l.feed_weight}kg`);
     if (l.feed_activity !== undefined) parts.push(`进食活动 ${l.feed_activity}`);
     if (l.camera_count !== undefined) parts.push(`摄像头识别数量 ${l.camera_count} 只`);
+    if (d.meta && d.meta.camera_status) {
+      parts.push('画面识别：' + String(d.meta.camera_status).replace(/\s+/g, ' ').slice(0, 140));
+    } else if (l.camera_count === undefined) {
+      parts.push('画面识别：未检测到物体状况（无画面或未识别）');
+    }
     const dinfo = densityInfo(d);
     if (dinfo.actual != null) {
       const ref = dinfo.ref ? `，参考 ${dinfo.ref.min}~${dinfo.ref.max} 只/㎡` : '';
@@ -1589,8 +1950,6 @@ function analyzeDevice(device) {
     { key: 'noise', label: '噪声', unit: 'dB' },
     { key: 'o2', label: '氧气', unit: '%' },
     { key: 'soil_temp', label: '土壤温度', unit: '°C' },
-    { key: 'feed_level', label: '饲料槽余量', unit: '%' },
-    { key: 'feed_weight', label: '饲料槽重量', unit: 'kg' },
     { key: 'feed_activity', label: '进食活动', unit: '' }
   ];
 
@@ -1777,14 +2136,22 @@ async function handleCozeChat(message, history, images) {
   // 注入当前环境数据 + 养殖对象患病因子，让智能体结合实时环境判断病因
   const envCtx = buildEnvironmentContext();
   const speciesCtx = buildSpeciesContext();
-  const realCtx = buildRealKnowledgeContext();
+  const realCtx = buildRealKnowledgeContext(message);
+  // 当地天气（外部诱因）
+  let weatherCtx = '';
+  try {
+    const w = await getWeather('');
+    if (w) weatherCtx = buildWeatherContext(Object.assign({ ok: true }, w));
+  } catch (e) { weatherCtx = ''; }
+
   let contextBlock = '';
   // 实时环境数据是本系统的核心优势，放最前优先判断
   if (envCtx) contextBlock += `【当前养殖环境实时数据（核心依据，优先分析）】\n${envCtx}\n\n`;
+  if (weatherCtx) contextBlock += `【当地天气（外部环境诱因）】\n${weatherCtx}\n\n`;
   if (realCtx) contextBlock += `${realCtx}\n\n`;
   if (speciesCtx) contextBlock += `【养殖对象与患病因子（通用知识）】\n${speciesCtx}\n\n`;
   const questionText = contextBlock
-    ? `${contextBlock}【用户问题】${message}\n\n请优先基于实时环境数据（尤其是超标项）分析病因与风险，再结合本场历史记录与物种通用知识判断；需要用药时在末尾给出【推荐药品】段落。`
+    ? `${contextBlock}【用户问题】${message}\n\n请优先基于实时环境数据（尤其是超标项）分析病因与风险，并结合当地天气判断外部诱因；再参考本场历史记录与物种通用知识；需要用药时在末尾给出【推荐药品】段落。`
     : message;
 
   // 本次消息：有图片用 object_string（多模态），否则纯文本
@@ -1800,19 +2167,27 @@ async function handleCozeChat(message, history, images) {
   }
 
   try {
-    const resp = await fetchAgent(baseUrl + '/v3/chat', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        bot_id: AGENT.botId,
-        user_id: AGENT.userId || 'web-user',
-        stream: true,             // 流式（auto_save_history=false 时必须是 true）
-        auto_save_history: false,
-        additional_messages: msgs
-      })
-    });
-
-    const text = await resp.text();
+    // 扣子免费额度有瞬时/分钟限流，遇到 4028 自动等几秒重试
+    let text = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const resp = await fetchAgent(baseUrl + '/v3/chat', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          bot_id: AGENT.botId,
+          user_id: AGENT.userId || 'web-user',
+          stream: true,             // 流式（auto_save_history=false 时必须是 true）
+          auto_save_history: false,
+          additional_messages: msgs
+        })
+      });
+      text = await resp.text();
+      if (!/4028|Insufficient coze credits/i.test(text)) break;
+      if (attempt < 2) {
+        console.log('[扣子] 额度限流，' + (2 + attempt * 2) + ' 秒后重试…');
+        await sleep(2000 + attempt * 2000);
+      }
+    }
 
     // 非流式错误会返回 JSON
     if (text.trim().startsWith('{')) {
@@ -1825,6 +2200,7 @@ async function handleCozeChat(message, history, images) {
     // 解析 SSE：event 名在单独一行，data 在下一行
     let answer = '';
     let currentEvent = '';
+    let failMsg = '';
     for (const line of text.split('\n')) {
       const t = line.trim();
       if (t.startsWith('event:')) {
@@ -1834,6 +2210,9 @@ async function handleCozeChat(message, history, images) {
         if (!payload || payload === '[DONE]') continue;
         try {
           const ev = JSON.parse(payload);
+          if (currentEvent === 'conversation.chat.failed') {
+            failMsg = (ev && ev.last_error && (ev.last_error.msg || ev.last_error.code)) || '扣子返回失败';
+          }
           if (currentEvent === 'conversation.message.delta' && ev && typeof ev.content === 'string' && ev.content && ev.content_type === 'text') {
             answer += ev.content;
           } else if (currentEvent === 'conversation.message.completed' && ev && ev.type === 'answer' && ev.content) {
@@ -1843,6 +2222,13 @@ async function handleCozeChat(message, history, images) {
       }
     }
 
+    // 扣子返回失败（如额度不足）时，把真实原因带回前端
+    if (!answer.trim() && failMsg) {
+      const friendly = /credit|quota|balance/i.test(failMsg)
+        ? '扣子额度不足（' + failMsg + '），请等待额度刷新或升级套餐'
+        : failMsg;
+      return { ok: false, error: friendly, from: 'coze' };
+    }
     if (!answer.trim()) answer = '（未收到回复）';
     return { ok: true, from: 'coze', reply: { role: 'assistant', content: answer } };
   } catch (e) {
@@ -1886,6 +2272,15 @@ loadConversationMeta();
 loadIllness();
 loadQueries();
 ensureDeviceChats();
+
+// 每小时把当天新增记录同步到扣子知识库（同一天只推一次）
+setInterval(() => {
+  syncKnowledgeBase().catch((e) => console.error('[知识库] 同步失败：', e.message));
+}, 3600 * 1000);
+setTimeout(() => {
+  syncKnowledgeBase().catch((e) => console.error('[知识库] 同步失败：', e.message));
+}, 30000);
+
 server.listen(PORT, HOST, () => {
   console.log('====================================================');
   console.log('  养殖环境实时监测系统已启动');
