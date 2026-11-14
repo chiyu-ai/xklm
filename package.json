@@ -4,6 +4,7 @@
   "description": "基于 ESP32-S3 的养殖环境监测与辅助诊断系统",
   "main": "server.js",
   "type": "commonjs",
+  "author": "小卡了米（段祖铭、谭博文）",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
