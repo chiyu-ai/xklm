@@ -42,13 +42,13 @@ const METRIC_ORDER = ['temperature', 'humidity', 'ammonia', 'co2', 'h2s', 'soil'
 
 function metricLabel(key) { return METRIC_LABELS[key] || key; }
 function metricUnit(key) { return METRIC_UNITS[key] || ''; }
-// 饲料槽状况文字
+// 饲料槽状况文字：次日剩余 ≤20% 说明吃干净了；>20% 提示采食不足
 function feedStatus(v) {
   const n = Number(v);
   if (!isFinite(n)) return '';
-  if (n < 20) return '缺料';
-  if (n < 60) return '偏低';
-  return '充足';
+  if (n <= 20) return '采食正常';
+  if (n <= 40) return '剩料偏多';
+  return '采食不足';
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -254,7 +254,7 @@ function renderDevices() {
         const cls = m.severity === 'severe' ? 'high' : m.severity === 'mild' ? 'low' : 'normal';
         const norm = (d.normal && d.normal[key]) || normalRange(d.meta && d.meta.species, key);
         const normHtml = key === 'feed_level'
-          ? `<div class="metric-normal">${feedStatus(m.value)} · 正常 20~100%</div>`
+          ? `<div class="metric-normal">${feedStatus(m.value)} · 正常 ≤20%</div>`
           : (norm ? `<div class="metric-normal">正常 ${norm.min}~${norm.max}${norm.unit}</div>` : '');
         return `<div class="metric ${cls}">
           <div class="metric-label">${escapeHtml(metricLabel(key))}</div>
@@ -506,7 +506,7 @@ function drawWeatherChart(hourly) {
 // 数据分析
 async function loadAnalysis() {
   try {
-    const res = await fetch('/api/analysis');
+    const res = await fetch('/api/analysis?city=' + encodeURIComponent(localStorage.getItem('weather-city') || ''));
     const data = await res.json();
     if (data.ok) {
       analysisData = data;
@@ -818,6 +818,7 @@ function openAddModal() {
   $('#dmArea').value = '';
   $('#dmStage').value = '';
   $('#dmWeight').value = '';
+  $('#dmFeedDaily').value = '';
   $('#deviceModal').classList.add('show');
 }
 
@@ -833,6 +834,7 @@ function openEditModal(id) {
   $('#dmArea').value = (d.meta && d.meta.area) || '';
   $('#dmStage').value = (d.meta && d.meta.stage) || '';
   $('#dmWeight').value = (d.meta && d.meta.weight) || '';
+  $('#dmFeedDaily').value = (d.meta && d.meta.feed_daily) || '';
   $('#deviceModal').classList.add('show');
 }
 
@@ -845,6 +847,7 @@ async function saveDevice() {
     count: Number($('#dmCount').value) || 0,
     area: Number($('#dmArea').value) || 0,
     stage: $('#dmStage').value,
+    feed_daily: Number($('#dmFeedDaily').value) || 0,
     weight: Number($('#dmWeight').value) || 0,
   };
   try {
@@ -1398,6 +1401,40 @@ async function newConversation() {
 }
 
 // 药品卡片：图片 + 购买链接
+// 候选病种确认卡：展示病症图 + 确认按钮，确认后才继续下一步
+function addCandidateCards(candidates, speciesName) {
+  const box = $('#chatMessages');
+  if (!box || !candidates || !candidates.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'cand-block';
+  wrap.innerHTML =
+    '<div class="cand-title">请确认是哪种病（点击图片查看真实症状）</div>' +
+    '<div class="cand-list">' + candidates.map((c) =>
+      '<a class="cand-card" href="' + escapeHtml(c.searchUrl || '#') + '" target="_blank" rel="noopener">' +
+      '<img class="cand-img" src="' + escapeHtml(c.image || '') + '" alt="">' +
+      '<div class="cand-name">' + escapeHtml(c.name || '') + '</div></a>').join('') + '</div>' +
+    '<div class="cand-actions">' +
+    candidates.map((c) => '<button class="btn primary cand-yes" type="button" data-name="' + escapeHtml(c.name || '') + '">是「' + escapeHtml(c.name || '') + '」</button>').join('') +
+    '<button class="btn ghost cand-no" type="button">都不是，重新判断</button>' +
+    '</div>' +
+    '<div class="cand-hint">确认后我再给出详细的防治方案</div>';
+  box.appendChild(wrap);
+
+  wrap.querySelectorAll('.cand-yes').forEach((b) => {
+    b.addEventListener('click', () => {
+      const name = b.getAttribute('data-name');
+      wrap.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+      sendChat('确认是「' + name + '」，请给出详细的防治方案', []);
+    });
+  });
+  const no = wrap.querySelector('.cand-no');
+  if (no) no.addEventListener('click', () => {
+    wrap.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+    sendChat('都不是，请重新判断可能是什么病，并列出候选', []);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
 function addDrugCards(drugs) {
   const box = $('#chatMessages');
   if (!box || !drugs || !drugs.length) return;
@@ -1440,7 +1477,8 @@ async function sendChat(message, images) {
         message,
         images: images.map((p) => p.file_id),
         history: chatHistory,
-        individualId: currentIndividual
+        individualId: currentIndividual,
+        city: savedCity()
       })
     });
     const data = await res.json();
@@ -1453,6 +1491,10 @@ async function sendChat(message, images) {
       const content = typeof reply === 'string' ? reply
         : (reply && (reply.content || reply.message || reply.text)) || JSON.stringify(reply);
       addMessage('assistant', content);
+      // 候选病种：先让用户确认，再继续下一步
+      if (Array.isArray(data.candidates) && data.candidates.length) {
+        addCandidateCards(data.candidates, data.speciesForCand);
+      }
       if (Array.isArray(data.drugs) && data.drugs.length) addDrugCards(data.drugs);
       chatHistory.push({ role: 'user', content: message });
       chatHistory.push({ role: 'assistant', content });
@@ -1493,6 +1535,29 @@ async function doLogin() {
 let detailTimer = null, recogTimer = null, currentDetailId = null;
 
 
+// 饲料槽卡片：RFP602 薄膜压力传感器给槽内余量，每日投喂量由用户填写
+function renderFeedCard(d) {
+  const box = $('#detailExtra');
+  if (!box) return;
+  const feed = (d && d.feed) || {};
+  const meta = (d && d.meta) || {};
+  const daily = Number(feed.daily || meta.feed_daily) || 0;
+  const level = (feed.level !== null && feed.level !== undefined) ? Number(feed.level) : null;
+  const weight = feed.weight !== null && feed.weight !== undefined ? Number(feed.weight) : null;
+  const abnormal = level !== null && level > 20;
+  const st = level === null ? '等待传感器数据' : (abnormal ? '采食不足（剩料多）' : '采食正常');
+  const cls = level === null ? '' : (abnormal ? 'danger' : 'ok');
+  const barW = level === null ? 0 : Math.max(2, Math.min(100, level));
+  box.innerHTML = '<div class="feed-card">' +
+    '<div class="feed-title">饲料槽状况</div>' +
+    '<div class="feed-bar"><i class="' + cls + '" style="width:' + barW + '%"></i></div>' +
+    '<div class="feed-row"><span>每日投喂</span><b>' + (daily > 0 ? daily + ' kg' : '未填写') + '</b></div>' +
+    '<div class="feed-row"><span>槽内余量</span><b>' + (level !== null ? level + '%' : '—') + '</b></div>' +
+    '<div class="feed-row"><span>约剩余</span><b>' + (weight !== null ? weight + ' kg' : '—') + '</b></div>' +
+    '<div class="feed-row"><span>状况</span><b class="feed-status ' + cls + '">' + st + '</b></div>' +
+    '<div class="feed-hint">次日余量 ≤20% 为正常；超过 20% 说明剩料多、采食不足</div></div>';
+}
+
 function openDetail(id) {
   const d = devices.get(id);
   if (!d) return;
@@ -1505,7 +1570,7 @@ function openDetail(id) {
     const cls = m.severity === 'severe' ? 'high' : m.severity === 'mild' ? 'low' : 'normal';
     const norm = (d.normal && d.normal[k]) || normalRange(d.meta && d.meta.species, k);
     const normHtml = k === 'feed_level'
-      ? `<div class="metric-normal">${feedStatus(m.value)} · 正常 20~100%</div>`
+      ? `<div class="metric-normal">${feedStatus(m.value)} · 正常 ≤20%</div>`
       : (norm ? `<div class="metric-normal">正常 ${norm.min}~${norm.max}${norm.unit}</div>` : '');
     return `<div class="metric ${cls} metric-clickable" data-metric="${k}">
       <div class="metric-label">${escapeHtml(metricLabel(k))}</div>
@@ -1535,6 +1600,9 @@ function openDetail(id) {
   $('#detailMetrics').querySelectorAll('[data-metric]').forEach((el) => {
     el.addEventListener('click', () => openMetricChart(id, el.getAttribute('data-metric')));
   });
+
+  // 饲料槽状况卡
+  renderFeedCard(d);
 
   $('#camImg').style.display = 'none';
   $('#camPlaceholder').style.display = 'block';
@@ -1667,7 +1735,11 @@ function startRecognition(id) {
       startWarnSteps(box);
     }
     try {
-      const res = await fetch('/api/health/' + encodeURIComponent(id), { method: 'POST' });
+      const res = await fetch('/api/health/' + encodeURIComponent(id), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ city: localStorage.getItem('weather-city') || '' })
+      });
       const data = await res.json();
       stopWarnSteps();
       if (data.ok) {

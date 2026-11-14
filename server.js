@@ -16,7 +16,6 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const url = require('url');
 const { URL } = require('url');
 
 // 配置
@@ -56,7 +55,7 @@ const AUTH = config.auth || { username: '1', password: '1' };
 const DEFAULT_NORMAL = {
   co2: { min: 0, max: 2500, unit: 'ppm' },
   soil: { min: 20, max: 100, unit: '%' },
-  feed_level: { min: 20, max: 100, unit: '%' }
+  feed_level: { min: 0, max: 20, unit: '%' }
 };
 
 function normalFor(speciesName, key) {
@@ -543,6 +542,41 @@ function envAnomalies(device) {
   return out;
 }
 
+// ───── 候选病种：从回答里识别病名，生成确认卡片（图片 + 真实症状图链接） ─────
+function diseaseCard(name, symptoms, speciesName) {
+  const sym = String(symptoms || '').replace(/\s+/g, ' ');
+  const short = sym.slice(0, 24);
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="220" height="150">' +
+    '<rect width="220" height="150" rx="14" fill="#fdf3e7" stroke="#ecdfc9"/>' +
+    '<rect x="18" y="18" width="184" height="34" rx="8" fill="#fbe0c8"/>' +
+    '<text x="110" y="41" font-size="15" text-anchor="middle" fill="#b45309">' + escapeXml(String(name).slice(0, 10)) + '</text>' +
+    '<text x="110" y="72" font-size="11" text-anchor="middle" fill="#8a7a66">典型症状</text>' +
+    '<text x="110" y="94" font-size="10" text-anchor="middle" fill="#6b3d1f">' + escapeXml(short) + '</text>' +
+    '<text x="110" y="126" font-size="10" text-anchor="middle" fill="#2f9e5b">点击查看真实症状图</text>' +
+    '</svg>';
+  return {
+    name,
+    symptoms: sym,
+    image: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg),
+    searchUrl: 'https://www.bing.com/images/search?q=' +
+      encodeURIComponent((speciesName || '') + ' ' + name + ' 症状')
+  };
+}
+
+// 在回答中匹配该物种的常见病，最多 3 个
+function extractCandidates(content, speciesName) {
+  const text = String(content || '');
+  const sp = SPECIES.find((s) => s.name === speciesName);
+  if (!sp || !Array.isArray(sp.diseases)) return [];
+  const out = [];
+  for (const d of sp.diseases) {
+    if (d && d.name && text.includes(d.name)) {
+      out.push(diseaseCard(d.name, d.symptoms, speciesName));
+    }
+  }
+  return out.slice(0, 3);
+}
+
 // 从回答中提取【推荐药品】段落，生成图片与购买链接
 function extractDrugs(content) {
   const text = String(content || '');
@@ -594,6 +628,12 @@ function buildHealthPrompt(device) {
   if (latest.co2 !== undefined) env.push('二氧化碳 ' + latest.co2 + 'ppm');
   if (latest.ammonia !== undefined) env.push('氨气 ' + latest.ammonia + 'ppm');
   if (latest.light !== undefined) env.push('光照 ' + latest.light + '%');
+  if (latest.feed_level !== undefined) {
+    const fd = Number(summary.feed.daily) || 0;
+    env.push('饲料槽余量 ' + latest.feed_level + '%' +
+      (fd > 0 ? '（每日投喂 ' + fd + 'kg，约剩 ' + summary.feed.weight + 'kg）' : '') +
+      (Number(latest.feed_level) > 20 ? '，剩料偏多，提示采食不足' : '，采食正常'));
+  }
   if (latest.camera_count !== undefined) env.push('摄像头识别数量 ' + latest.camera_count + ' 只');
   if (device.meta && device.meta.camera_status) {
     env.push('画面识别：' + String(device.meta.camera_status).replace(/\s+/g, ' ').slice(0, 140));
@@ -725,9 +765,19 @@ function deviceNameFromIp(ip) {
   return ip ? 'esp32-' + ip.replace(/[^0-9a-zA-Z]/g, '-') : 'esp32-unknown';
 }
 
+// 解析请求 URL。用 WHATWG URL 而不是已弃用的 url.parse，
+// query 仍摊平成普通对象，调用方照旧写 parsed.query.city
+function parseUrl(req) {
+  const host = req.headers.host || 'localhost';
+  const u = new URL(req.url, 'http://' + host);
+  const query = {};
+  for (const [k, v] of u.searchParams) query[k] = v;
+  return { pathname: u.pathname, query, searchParams: u.searchParams };
+}
+
 // 解析设备 ID：优先 URL 路径 > 查询参数 > JSON body > 客户端 IP
 function resolveDeviceId(req, body) {
-  const parsed = url.parse(req.url, true);
+  const parsed = parseUrl(req);
   const q = parsed.query || {};
 
   // 1) URL 路径 /api/data/:deviceId
@@ -920,6 +970,23 @@ function deviceSummary(device) {
   }
 
   const online = now() - (device.lastSeen || 0) < OFFLINE_AFTER_MS;
+
+  // 饲料槽：传感器给槽内余量百分比，每日投喂量由用户填
+  // 规则：次日剩余 ≤20% 说明吃干净了（正常）；>20% 说明采食不足
+  const feedDaily = Number(device.meta && device.meta.feed_daily) || 0;
+  const feedLevel = latest.feed_level !== undefined ? Number(latest.feed_level) : null;
+  if (feedLevel !== null && metrics.feed_level) {
+    const over = feedLevel > 20;
+    metrics.feed_level.status = over ? 'high' : 'normal';
+    metrics.feed_level.severity = over ? (feedLevel > 40 ? 'severe' : 'mild') : 'normal';
+  }
+  const feed = {
+    daily: feedDaily,
+    level: feedLevel,
+    weight: (feedDaily > 0 && feedLevel !== null) ? Number(((feedDaily * feedLevel) / 100).toFixed(2)) : null,
+    status: feedLevel === null ? 'unknown' : (feedLevel > 20 ? 'abnormal' : 'normal')
+  };
+
   return {
     id: device.id,
     name: device.name,
@@ -929,12 +996,14 @@ function deviceSummary(device) {
     lastSeenText: isoTime(device.lastSeen),
     createdAt: device.createdAt,
     metrics,
+    feed,
     meta: {
       species: (device.meta && device.meta.species) || '',
       count: (device.meta && device.meta.count) || 0,
       area: (device.meta && device.meta.area) || 0,
       stage: (device.meta && device.meta.stage) || '',
       weight: (device.meta && device.meta.weight) || 0,
+      feed_daily: feedDaily,
       camera_status: (device.meta && device.meta.camera_status) || '',
       camera_time: (device.meta && device.meta.camera_time) || '',
       local_ip: (device.meta && device.meta.local_ip) || '',
@@ -1078,28 +1147,54 @@ function aqiLevel(v) {
 let weatherCache = { key: '', ts: 0, data: null };
 const WEATHER_TTL = 10 * 60 * 1000;
 
+// 城市名 → 经纬度：从完整名称逐步截短重试（「重庆渝北区」→「重庆渝北」→「重庆」）
+async function geocodeCity(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return null;
+  const tries = [raw];
+  const stripped = raw.replace(/[区县市镇乡]+$/, '');
+  if (stripped && stripped !== raw) tries.push(stripped);
+  // 中文名超过 2 字时，再用前 2 字兜底（「重庆渝北区」→「重庆」）
+  if (/^[\u4e00-\u9fa5]{3,}$/.test(raw)) {
+    const head = raw.slice(0, 2);
+    if (!tries.includes(head)) tries.push(head);
+  }
+  for (const t of tries) {
+    try {
+      const geoUrl = 'https://geocoding-api.open-meteo.com/v1/search?name=' +
+        encodeURIComponent(t) + '&count=1&language=zh&format=json';
+      const geoData = await (await fetch(geoUrl)).json();
+      const hit = geoData.results && geoData.results[0];
+      if (hit) return hit;
+    } catch (e) { /* 继续尝试下一个名称 */ }
+  }
+  return null;
+}
+
 async function getWeather(cityName) {
   const key = String(cityName || '').trim() || process.env.WEATHER_CITY || (config.weather && config.weather.city) || '广州';
   if (weatherCache.key === key && Date.now() - weatherCache.ts < WEATHER_TTL) return weatherCache.data;
 
   let lat = (config.weather && config.weather.lat) || 23.13;
   let lon = (config.weather && config.weather.lon) || 113.26;
-  let city = key;
+  let city = (config.weather && config.weather.city) || '广州';
+  let matched = false;
 
   // 城市名 → 经纬度
-  try {
-    if (key && key !== ((config.weather && config.weather.city) || '')) {
-      const geoUrl = 'https://geocoding-api.open-meteo.com/v1/search?name=' +
-        encodeURIComponent(key) + '&count=1&language=zh&format=json';
-      const geoData = await (await fetch(geoUrl)).json();
-      const hit = geoData.results && geoData.results[0];
-      if (hit) {
-        lat = hit.latitude;
-        lon = hit.longitude;
-        city = hit.name || key;
-      }
+  if (key && key !== ((config.weather && config.weather.city) || '')) {
+    const hit = await geocodeCity(key);
+    if (hit) {
+      lat = hit.latitude;
+      lon = hit.longitude;
+      city = hit.name || key;      // 用解析到的真实地名，避免张冠李戴
+      matched = true;
+    } else {
+      // 明确报错，不再偷偷用默认城市的数据冒充
+      const err = { ok: false, error: '未找到「' + key + '」，请换个名称试试（如「重庆」「重庆渝中」）' };
+      weatherCache = { key, ts: Date.now(), data: err };
+      return err;
     }
-  } catch (e) { /* 地理编码失败就用默认坐标 */ }
+  }
 
   const u = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon +
     '&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,cloud_cover,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m' +
@@ -1220,7 +1315,7 @@ function buildWeatherContext(w) {
 
 // 路由
 const server = http.createServer(async (req, res) => {
-  const parsed = url.parse(req.url, true);
+  const parsed = parseUrl(req);
   const pathname = parsed.pathname;
 
   // CORS 预检
@@ -1321,6 +1416,7 @@ const server = http.createServer(async (req, res) => {
         if (body.area != null && !isNaN(Number(body.area))) device.meta.area = Number(body.area);
         if (body.stage != null) device.meta.stage = String(body.stage).trim();
         if (body.weight != null && !isNaN(Number(body.weight))) device.meta.weight = Number(body.weight);
+        if (body.feed_daily != null && !isNaN(Number(body.feed_daily))) device.meta.feed_daily = Number(body.feed_daily);
         if (body.name != null && String(body.name).trim()) {
           device.name = String(body.name).trim();
           device.meta.nameSet = true;   // 用户自定义名称，ESP32 上报不再覆盖
@@ -1537,17 +1633,20 @@ const server = http.createServer(async (req, res) => {
       const id = decodeURIComponent(healthMatch[1]);
       const dev = devices.get(id);
       if (!dev) { sendJson(res, 404, { ok: false, error: '设备不存在' }); return; }
+      let hb = {};
+      try { hb = await parseJsonBody(req); } catch (e) { hb = {}; }
+      const city = (hb && hb.city) || parsed.query.city || '';
       let prompt = buildHealthPrompt(dev);
       // 结合当地天气作为外部诱因（寒潮导致发烧、大风雷暴损坏棚舍等）
       try {
-        const w = await getWeather('');
+        const w = await getWeather(city);
         if (w) {
           prompt += '\n\n【当地天气（外部环境参考）】\n' + buildWeatherContext(Object.assign({ ok: true }, w)) +
             '\n· 请结合天气判断外部诱因：如寒潮/高温应激引发发烧或采食下降、大风雷暴损坏棚舍导致环境骤变、连阴雨导致垫料潮湿诱发球虫等。';
         }
       } catch (e) { /* 天气获取失败不影响预警 */ }
       try {
-        const reply = await handleCozeChat(prompt, [], []);
+        const reply = await handleCozeChat(prompt, [], [], (hb && hb.city) || '');
         const result = reply.ok ? (reply.reply && reply.reply.content) : (reply.error || '分析失败');
         let file = null;
         if (reply.ok && result) {
@@ -1670,6 +1769,20 @@ const server = http.createServer(async (req, res) => {
         }
       } catch (e) { console.error('[查询] 记录失败：', e.message); }
       reply.drugs = extractDrugs(reply.reply && reply.reply.content);
+
+      // 候选病种：供前端展示病症图让用户确认，确认后再继续
+      if (reply.ok) {
+        const msgText = String(message || '');
+        // 用户已经在确认/否认，不再重复弹确认卡
+        const isConfirm = /^确认是|^都不是/.test(msgText.trim());
+        const spHit = SPECIES.find((s) => s.name && msgText.includes(s.name));
+        const firstDev = devices.values().next().value;
+        const spForCand = (spHit && spHit.name) || ((firstDev && firstDev.meta && firstDev.meta.species) || '');
+        reply.candidates = isConfirm ? [] : extractCandidates(reply.reply && reply.reply.content, spForCand);
+        reply.speciesForCand = spForCand;
+        reply.pendingConfirm = reply.candidates.length > 0;
+      }
+
       sendJson(res, 200, reply);
       return;
     }
@@ -1785,7 +1898,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/api/analysis') {
       // 当地天气作为外部诱因参考（如大风雷暴损坏棚舍导致环境异常）
       let w = null;
-      try { w = await getWeather(''); } catch (e) { w = null; }
+      try { w = await getWeather(parsed.query.city || ''); } catch (e) { w = null; }
       const wBrief = w ? {
         city: w.city, desc: w.desc, temperature: w.temperature,
         humidity: w.humidity, wind: w.wind, windDir: w.windDir, risks: w.risks
@@ -1874,6 +1987,12 @@ function buildEnvironmentContext() {
     if (l.noise !== undefined) parts.push(`噪声 ${l.noise}dB`);
     if (l.o2 !== undefined) parts.push(`氧气 ${l.o2}%`);
     if (l.soil_temp !== undefined) parts.push(`土壤温度 ${l.soil_temp}°C`);
+    if (l.feed_level !== undefined) {
+      const fd = Number(d.meta && d.meta.feed_daily) || 0;
+      parts.push(`饲料槽余量 ${l.feed_level}%` +
+        (fd > 0 ? `（每日投喂 ${fd}kg，约剩 ${((fd * Number(l.feed_level)) / 100).toFixed(2)}kg）` : '') +
+        (Number(l.feed_level) > 20 ? '，剩料偏多提示采食不足' : '，采食正常'));
+    }
     if (l.feed_activity !== undefined) parts.push(`进食活动 ${l.feed_activity}`);
     if (l.camera_count !== undefined) parts.push(`摄像头识别数量 ${l.camera_count} 只`);
     if (d.meta && d.meta.camera_status) {
@@ -1895,11 +2014,19 @@ function buildEnvironmentContext() {
 }
 
 // 生成养殖对象（物种）的正常环境/饮食/患病因子摘要
-function buildSpeciesContext() {
+function buildSpeciesContext(message) {
   const speciesSet = new Set();
+  // 1) 在线设备涉及的物种
   for (const d of devices.values()) {
     const s = d.meta && d.meta.species;
     if (s) speciesSet.add(s);
+  }
+  // 2) 用户问题里提到的物种（问牛就带牛的疫病库，不受在线设备限制）
+  const text = String(message || '');
+  if (text) {
+    for (const sp of SPECIES) {
+      if (sp.name && text.includes(sp.name)) speciesSet.add(sp.name);
+    }
   }
   if (speciesSet.size === 0) return '';
 
@@ -1950,6 +2077,7 @@ function analyzeDevice(device) {
     { key: 'noise', label: '噪声', unit: 'dB' },
     { key: 'o2', label: '氧气', unit: '%' },
     { key: 'soil_temp', label: '土壤温度', unit: '°C' },
+    { key: 'feed_level', label: '饲料槽余量', unit: '%' },
     { key: 'feed_activity', label: '进食活动', unit: '' }
   ];
 
@@ -2082,7 +2210,7 @@ async function handleChat(body) {
 
   // 扣子（Coze）智能体
   if (AGENT.type === 'coze' && AGENT.botId) {
-    return await handleCozeChat(fullMessage, hist, images);
+    return await handleCozeChat(fullMessage, hist, images, (body && body.city) || '');
   }
 
   // 已配置外部智能体：转发请求
@@ -2117,7 +2245,7 @@ async function handleChat(body) {
 }
 
 // 扣子（Coze）智能体：流式对话，解析 SSE 取回复
-async function handleCozeChat(message, history, images) {
+async function handleCozeChat(message, history, images, city) {
   const baseUrl = AGENT.baseUrl || 'https://api.coze.cn';
   const headers = {
     'Content-Type': 'application/json',
@@ -2135,12 +2263,12 @@ async function handleCozeChat(message, history, images) {
 
   // 注入当前环境数据 + 养殖对象患病因子，让智能体结合实时环境判断病因
   const envCtx = buildEnvironmentContext();
-  const speciesCtx = buildSpeciesContext();
+  const speciesCtx = buildSpeciesContext(message);
   const realCtx = buildRealKnowledgeContext(message);
   // 当地天气（外部诱因）
   let weatherCtx = '';
   try {
-    const w = await getWeather('');
+    const w = await getWeather(city || '');
     if (w) weatherCtx = buildWeatherContext(Object.assign({ ok: true }, w));
   } catch (e) { weatherCtx = ''; }
 

@@ -22,6 +22,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
+#include <Preferences.h>
 #include "esp_camera.h"
 #include <mbedtls/base64.h>
 
@@ -38,11 +39,12 @@ const char* DEVICE_NAME = "1号鸡舍";
 #define DHTTYPE     DHT11
 #define PIN_SOIL    1    // 土壤 AO  ADC1_CH0
 // JW01 二氧化碳（UART1，A/B 为 TTL 串口，9600 8N1）
-#define PIN_CO2_RX  2    // JW01 B(模块TX) → ESP32 RX
-#define PIN_CO2_TX  14   // JW01 A(模块RX) → ESP32 TX（可不接）
-// SC7A20H 进食检测（UART2）
-#define PIN_FEED_RX 38   // SC7A20H TX → ESP32 RX
-#define PIN_FEED_TX 39   // SC7A20H RX → ESP32 TX（可不接）
+// ★ 本板 esp32-s3-cam v1.5：GPIO48 是板载 WS2812 彩灯，不能占用；
+//   ADC1 只剩 1/2/3，2 号让给压力传感器，CO2 接收改到空闲的 14 号
+#define PIN_CO2_RX  14   // JW01 B(模块TX) → ESP32 RX（线从 2 号挪到 14 号）
+#define PIN_CO2_TX  -1   // 不接（只收不发）
+// RFP602 薄膜压力传感器（饲料槽余量）→ ADC1_CH1
+#define PIN_FEED_FSR 2   // RFP602 AO → ESP32（模块版直接接，裸片要 10k 分压）
 #define PIN_LIGHT   3    // 光敏 AO  ADC1_CH2
 #define PIN_FLAME   21   // 火焰 DO
 #define OLED_SDA    41   // OLED SDA
@@ -73,14 +75,21 @@ const char* DEVICE_NAME = "1号鸡舍";
 #define SOIL_DRY     3200
 #define SOIL_WET     1400
 
+// RFP602 饲料槽标定（串口命令 t=空槽  f=满槽  r=查看  c=清除）
+// 压力越大 → RFP602 电阻越小 → 分压点电压越高 → 读数越大
+// 标定值存 NVS，断电不丢；没标定前不上报 feed_level（避免悬空引脚报假数）
+int fsrEmptyVal = 0;
+int fsrFullVal  = 0;
+bool fsrCalibrated = false;
+
 // JW01 模拟 CO2 标定（模块到了按实际输出改这里）
 #define CO2_CAL_V0    0.4f    // 低浓度对应电压
 #define CO2_CAL_PPM0  400.0f  // 低浓度值
 #define CO2_CAL_V1    2.0f    // 高浓度对应电压
 #define CO2_CAL_PPM1  2000.0f // 高浓度值
 
-#define REPORT_INTERVAL 3000    // 环境数据每 3 秒上报一次
-#define READ_INTERVAL   3000    // 传感器每 3 秒采集一次
+#define REPORT_INTERVAL 1000    // 环境数据每 1 秒上报一次
+#define READ_INTERVAL   1000    // 传感器每 1 秒采集一次
 #define PAGE_INTERVAL   3000
 #define CAM_INTERVAL    1000    // 摄像头保持 1 秒一帧
 
@@ -92,14 +101,19 @@ volatile bool streamingActive = false;
 
 // 串口模块
 HardwareSerial co2Serial(1);         // JW01 二氧化碳 UART1
-HardwareSerial feedSerial(2);        // SC7A20H 进食 UART2
 uint8_t co2Frame[9];
 int co2Idx = 0;
-uint8_t feedBuf[32];
-int feedIdx = 0;
-float feedActivity = 0;
+
+// 饲料槽
+int fsrRaw = 0;
+int feedLevel = 0;                   // 0~100%，槽内余量
+bool fsrOk = false;
+Preferences prefs;                   // 标定值存 NVS
 
 float temp = 0, hum = 0, co2 = 0;
+bool dhtOk = false;                  // DHT11 本次读数是否有效
+unsigned long lastDht = 0;           // 上次读取 DHT 的时间
+int dhtFail = 0;                     // 连续失败次数
 int soilRaw = 0, lightRaw = 0, flame = 0;
 unsigned long lastRead = 0, lastReport = 0, lastPage = 0, lastCam = 0;
 int page = 0;
@@ -195,9 +209,20 @@ void setup() {
   pinMode(PIN_FLAME, INPUT);
   dht.begin();
 
-  // 串口模块：JW01 二氧化碳 + SC7A20H 进食检测
+  // 饲料槽压力传感器
+  pinMode(PIN_FEED_FSR, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_FEED_FSR, ADC_11db);   // 0~3.1V 量程
+  // 读取上次标定值
+  prefs.begin("farm", false);
+  fsrEmptyVal    = prefs.getInt("fsrE", 0);
+  fsrFullVal     = prefs.getInt("fsrF", 0);
+  fsrCalibrated  = prefs.getBool("fsrC", false);
+  Serial.printf("[饲料槽] 标定 empty=%d full=%d cal=%d（串口 t/f/r/c）\n",
+    fsrEmptyVal, fsrFullVal, fsrCalibrated ? 1 : 0);
+
+  // JW01 二氧化碳（只收不发）
   co2Serial.begin(9600, SERIAL_8N1, PIN_CO2_RX, PIN_CO2_TX);
-  feedSerial.begin(9600, SERIAL_8N1, PIN_FEED_RX, PIN_FEED_TX);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println("OLED 失败");
@@ -226,6 +251,7 @@ void setup() {
 }
 
 void loop() {
+  handleCalibCmd();   // 串口标定：t=空槽  f=满槽  r=查看
   if (millis() - lastRead >= READ_INTERVAL) { lastRead = millis(); readSensors(); }
   if (millis() - lastPage >= PAGE_INTERVAL) { lastPage = millis(); page = (page + 1) % 3; drawDisplay(); }
   if (millis() - lastReport >= REPORT_INTERVAL) {
@@ -249,6 +275,8 @@ float readCO2() {
     if (co2Idx >= 6) {
       uint8_t sum = 0;
       for (int i = 0; i < 5; i++) sum += co2Frame[i];
+      Serial.printf("[JW01] %02X %02X %02X %02X %02X %02X (sum=%02X)\n",
+        co2Frame[0], co2Frame[1], co2Frame[2], co2Frame[3], co2Frame[4], co2Frame[5], sum);
       if (sum == co2Frame[5]) {
         co2 = (co2Frame[1] << 8) | co2Frame[2];
       }
@@ -258,28 +286,101 @@ float readCO2() {
   return co2;
 }
 
-// SC7A20H 原始字节打印（先确认协议，再解析进食活动）
+// RFP602 读数：8 次平均去抖
+int readFsrRaw() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(PIN_FEED_FSR);
+  return (int)(sum / 8);
+}
+
+// 原始值 → 余量百分比（空槽 0%，满槽 100%）
 void readFeed() {
-  while (feedSerial.available()) {
-    feedBuf[feedIdx++] = feedSerial.read();
-    if (feedIdx >= 32) {
-      Serial.print("[SC7] ");
-      for (int i = 0; i < 32; i++) Serial.printf("%02X ", feedBuf[i]);
-      Serial.println();
-      feedIdx = 0;
-    }
+  fsrRaw = readFsrRaw();
+  if (!fsrCalibrated) {          // 没标定就不上报，避免悬空引脚报假数
+    feedLevel = 0;
+    fsrOk = false;
+    return;
+  }
+  int lo = min(fsrEmptyVal, fsrFullVal);
+  int hi = max(fsrEmptyVal, fsrFullVal);
+  if (hi - lo < 80) {
+    feedLevel = 0;
+    fsrOk = false;
+    return;
+  }
+  fsrOk = true;
+  bool rising = fsrFullVal >= fsrEmptyVal;
+  feedLevel = constrain(map(fsrRaw, rising ? lo : hi, rising ? hi : lo, 0, 100), 0, 100);
+}
+
+// 保存标定值到 NVS（断电不丢）
+void saveCal() {
+  int lo = min(fsrEmptyVal, fsrFullVal);
+  int hi = max(fsrEmptyVal, fsrFullVal);
+  fsrCalibrated = (hi - lo >= 80);
+  prefs.putInt("fsrE", fsrEmptyVal);
+  prefs.putInt("fsrF", fsrFullVal);
+  prefs.putBool("fsrC", fsrCalibrated);
+}
+
+// 串口标定：t=空槽   f=满槽   r=查看   c=清除
+void handleCalibCmd() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd == "t") {
+    fsrEmptyVal = readFsrRaw();
+    saveCal();
+    Serial.printf("[饲料槽] 空槽标定完成 empty=%d full=%d %s\n",
+      fsrEmptyVal, fsrFullVal, fsrCalibrated ? "（已生效）" : "（还需发 f 标定满槽）");
+  } else if (cmd == "f") {
+    fsrFullVal = readFsrRaw();
+    saveCal();
+    Serial.printf("[饲料槽] 满槽标定完成 empty=%d full=%d %s\n",
+      fsrEmptyVal, fsrFullVal, fsrCalibrated ? "（已生效）" : "（还需发 t 标定空槽）");
+  } else if (cmd == "r") {
+    Serial.printf("[饲料槽] raw=%d empty=%d full=%d level=%d%% cal=%d ok=%d\n",
+      readFsrRaw(), fsrEmptyVal, fsrFullVal, feedLevel, fsrCalibrated ? 1 : 0, fsrOk ? 1 : 0);
+  } else if (cmd == "c") {
+    fsrEmptyVal = 0; fsrFullVal = 0; fsrCalibrated = false; fsrOk = false; feedLevel = 0;
+    saveCal();
+    Serial.println("[饲料槽] 标定已清除，重新发 t / f");
   }
 }
 
 void readSensors() {
-  temp = dht.readTemperature(); hum = dht.readHumidity();
-  if (isnan(temp)) temp = 0; if (isnan(hum)) hum = 0;
+  // DHT11 读取间隔 2.5 秒 + 3 次重试（实测这组参数最稳）
+  if (lastDht == 0 || millis() - lastDht >= 2500) {
+    lastDht = millis();
+    float t = NAN, h = NAN;
+    for (int attempt = 0; attempt < 3; attempt++) {
+      t = dht.readTemperature();
+      h = dht.readHumidity();
+      if (!isnan(t) && !isnan(h)) break;
+      delay(150);
+    }
+    if (!isnan(t) && !isnan(h)) {
+      temp = t; hum = h; dhtOk = true; dhtFail = 0;
+    } else {
+      dhtFail++;
+      // 连续失败时重新初始化总线，能救回卡住的传感器
+      if (dhtFail % 2 == 0) dht.begin();
+      // 连续失败 6 次（约 15 秒）才判定失效，短暂抖动不影响显示
+      if (dhtFail >= 6) dhtOk = false;
+    }
+  }
   soilRaw = analogRead(PIN_SOIL);
   co2 = readCO2();
   readFeed();
   lightRaw = analogRead(PIN_LIGHT);
   flame = digitalRead(PIN_FLAME);
-  Serial.printf("T=%.1fC H=%.0f%% | soil=%d co2=%.0f light=%d | flame=%d\n", temp, hum, soilRaw, co2, lightRaw, flame);
+  if (dhtOk) {
+    Serial.printf("T=%.1fC H=%.0f%% | soil=%d co2=%.0f light=%d | flame=%d | feed=%d%%(%d)\n",
+      temp, hum, soilRaw, co2, lightRaw, flame, feedLevel, fsrRaw);
+  } else {
+    Serial.printf("DHT11 读取失败 | soil=%d co2=%.0f light=%d | flame=%d | feed=%d%%(%d)\n",
+      soilRaw, co2, lightRaw, flame, feedLevel, fsrRaw);
+  }
 }
 
 void drawDisplay() {
@@ -293,9 +394,10 @@ void drawDisplay() {
     display.setTextSize(1); display.setCursor(110, 42); display.print("%");
   } else if (page == 1) {
     display.setTextSize(1);
-    display.setCursor(0, 4);  display.printf("Soil : %d%%", soilPct);
-    display.setCursor(0, 22); display.printf("CO2  : %.0fppm", co2);
-    display.setCursor(0, 40); display.printf("Light: %d%%", lightPct);
+    display.setCursor(0, 2);  display.printf("Soil : %d%%", soilPct);
+    display.setCursor(0, 18); display.printf("CO2  : %.0fppm", co2);
+    display.setCursor(0, 34); display.printf("Light: %d%%", lightPct);
+    display.setCursor(0, 50); display.printf("Feed : %d%%", fsrOk ? feedLevel : 0);
   } else {
     display.setTextSize(1);
     display.setCursor(0, 4);  display.print(flame == FLAME_ACTIVE ? "Flame: ALARM!" : "Flame: SAFE");
@@ -323,9 +425,10 @@ void reportEnv() {
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(5000);
   String payload = "{\"device_id\":\"" + String(DEVICE_ID) + "\",\"name\":\"" + String(DEVICE_NAME) + "\","
-    "\"temperature\":" + String(temp, 1) + ",\"humidity\":" + String(hum, 0) + ","
-    "\"soil\":" + String(soilPct) + ",\"co2\":" + String(co2, 0) + ",\"light\":" + String(lightPct) + ",\"flame\":" + String(fire) + ","
-    "\"local_ip\":\"" + localIp + "\",\"stream_port\":81}";
+    + (dhtOk ? ("\"temperature\":" + String(temp, 1) + ",\"humidity\":" + String(hum, 0) + ",") : "")
+    + "\"soil\":" + String(soilPct) + ",\"co2\":" + String(co2, 0) + ",\"light\":" + String(lightPct) + ",\"flame\":" + String(fire) + ","
+    + (fsrOk ? ("\"feed_level\":" + String(feedLevel) + ",") : "")
+    + "\"local_ip\":\"" + localIp + "\",\"stream_port\":81}";
   int code = http.POST(payload);
   Serial.printf("[环境] HTTP %d\n", code);
   http.end();
