@@ -1609,7 +1609,12 @@ const server = http.createServer(async (req, res) => {
         if (id === 'main') {
           const archived = archive ? archiveConversation('main') : 0;
           conversations.set('main', []);
+          // 主对话每问一句就按内容自动改名（「主对话 · 猪舍温度…」）。
+          // 清空后必须把名字一起复位，否则标签还是旧标题，看着像没删掉
+          const mm = conversationMeta.get('main') || { bound: false, deviceId: '' };
+          conversationMeta.set('main', Object.assign({}, mm, { name: '主对话', nameSet: false }));
           saveConversations();
+          saveConversationMeta();
           sendJson(res, 200, { ok: true, cleared: true, archived });
           return;
         }

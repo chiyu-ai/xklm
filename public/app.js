@@ -1073,7 +1073,8 @@ async function loadConversationList() {
     const chip = (c) => {
       const label = c.name || c.id;
       const badge = c.bound ? '<span class="convo-bound" title="设备绑定，不可删除">设备</span>' : '';
-      const del = c.bound ? '' : '<span class="convo-del" data-del="' + escapeHtml(c.id) + '" title="删除聊天">×</span>';
+      const delTitle = c.id === 'main' ? '清空主对话（聊天框保留）' : '删除聊天';
+      const del = c.bound ? '' : '<span class="convo-del" data-del="' + escapeHtml(c.id) + '" title="' + delTitle + '">×</span>';
       const active = c.id === currentIndividual ? ' active' : '';
       return '<button class="convo-chip' + active + '" type="button" data-id="' + escapeHtml(c.id) + '">' +
         escapeHtml(label) + ' <span class="convo-count">' + c.count + '</span>' + badge + del + '</button>';
@@ -1094,10 +1095,13 @@ async function loadConversationList() {
       d.addEventListener('click', async (e) => {
         e.stopPropagation();
         const id = d.getAttribute('data-del');
+        const isMain = id === 'main';
         const ans = prompt(
-          '删除聊天「' + id + '」？\n\n' +
-          '1 = 直接删除\n' +
-          '2 = 删除聊天框，但把记录存入真实知识库\n\n' +
+          (isMain
+            ? '清空主对话？\n（主对话是常驻入口，不会删除，只会清空消息并恢复默认名称）\n\n'
+            : '删除聊天「' + id + '」？\n\n') +
+          '1 = ' + (isMain ? '清空' : '直接删除') + '\n' +
+          '2 = ' + (isMain ? '清空' : '删除聊天框') + '，但把记录存入真实知识库\n\n' +
           '请输入 1 / 2（默认 1）',
           '1'
         );
