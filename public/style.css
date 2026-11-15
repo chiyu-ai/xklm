@@ -857,3 +857,90 @@ body {
 .feed-bar { height: 8px; border-radius: 6px; background: #efe6d8; overflow: hidden; margin: 2px 0 10px; }
 .feed-bar i { display: block; height: 100%; border-radius: 6px; background: var(--accent-2); transition: width .4s ease; }
 .feed-bar i.danger { background: var(--danger); }
+
+/* ---------- 手机端：知识库 / 预警记录 等长内容弹窗改成全屏单层滚动 ---------- */
+/* 原来是「面板 overflow:auto + 内容区 max-height:66vh overflow:auto」两层滚动，
+   手机上触摸容易卡在半截，看起来像内容没显示出来。改成整屏、头部固定、只有一个滚动区。 */
+@media (max-width: 640px) {
+  .modal-mask.show { align-items: stretch; justify-content: stretch; padding: 0; }
+
+  #realKbModal .detail-panel,
+  #warningModal .detail-panel,
+  #marketModal .detail-panel,
+  #chartModal .detail-panel {
+    width: 100vw !important;
+    max-width: 100vw !important;
+    height: 100vh;
+    height: 100dvh;          /* 手机浏览器地址栏收起时不留白 */
+    max-height: 100vh;
+    max-height: 100dvh;
+    border-radius: 0;
+    padding: 0;
+    overflow: hidden;        /* 面板本身不再滚动 */
+    display: flex;
+    flex-direction: column;
+  }
+
+  #realKbModal .detail-head,
+  #warningModal .detail-head,
+  #marketModal .detail-head,
+  #chartModal .detail-head {
+    flex: none;
+    margin: 0;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--card);
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  #realKbModal .detail-head h3,
+  #warningModal .detail-head h3,
+  #marketModal .detail-head h3,
+  #chartModal .detail-head h3 { font-size: 15px; }
+
+  #realKbModal .detail-head .btn,
+  #warningModal .detail-head .btn,
+  #marketModal .detail-head .btn,
+  #chartModal .detail-head .btn { padding: 5px 9px; font-size: 12px; }
+
+  /* 行情弹窗里的说明条不参与伸缩，避免被压扁 */
+  .market-meta { flex: none; }
+
+  /* 唯一滚动区 */
+  .real-kb-body,
+  .market-body,
+  .warning-body,
+  .chart-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    padding: 12px 14px 24px;
+  }
+
+  /* 知识库：卡片单列铺满，字号不要缩太小 */
+  .rk-params { grid-template-columns: 1fr; gap: 8px; }
+  .rk-card, .rk-record { padding: 10px 12px; }
+  .rk-disease, .rk-records-title { font-size: 14px; }
+  .rk-rec-sub, .rk-rec-env, .rk-env, .rk-sym, .rk-answer { font-size: 12.5px; }
+  .rk-rec-head { font-size: 13px; }
+
+  /* 预警记录：两栏变上下排，内容区给足高度 */
+  .warning-body {
+    display: block !important;
+    grid-template-columns: none !important;
+  }
+  .warning-body .warning-toolbar { margin-bottom: 10px; }
+  .warning-body .warning-list {
+    max-height: 34vh;
+    overflow-y: auto;
+    margin-bottom: 10px;
+  }
+  .warning-body .warning-view {
+    min-height: 40vh;
+    max-height: none;
+  }
+  .warning-view .warning-pre { font-size: 12.5px; }
+}
