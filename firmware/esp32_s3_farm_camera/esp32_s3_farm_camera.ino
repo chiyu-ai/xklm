@@ -95,7 +95,8 @@ bool fsrCalibrated = false;
 #define CAM_INTERVAL    1000    // 摄像头保持 1 秒一帧
 #define CAM_UPLOAD_ENABLED 1    // 1=上传快照，0=暂停（排查用）
 
-DHT dht(PIN_DHT, DHTTYPE);
+int  dhtPin = PIN_DHT;      // 实际使用的 DHT 数据脚（开机探测）
+DHT* dht = nullptr;
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 WebServer streamServer(81);          // 视频流服务，端口 81
 SemaphoreHandle_t camMutex = NULL;   // 摄像头互斥锁（流/快照不能同时用）
@@ -214,7 +215,26 @@ void setup() {
 
   pinMode(PIN_FLAME, INPUT);
   pinMode(PIN_DHT, INPUT_PULLUP);   // DHT11 数据线靠上拉维持电平
-  dht.begin();
+  // 开机探测 DHT 接在哪个脚（换线后不用改代码）
+  // 上次探测到的脚存在 NVS，先直接用，省得每次开机都挨个试
+  int saved = prefs.getInt("dhtPin", -1);
+  int found = -1;
+  if (saved >= 0) {
+    DHT probe(saved, DHTTYPE);
+    probe.begin();
+    delay(1200);
+    float t = probe.readTemperature();
+    float h = probe.readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      Serial.printf("[诊断] DHT11 沿用上次引脚 GPIO%d（%.1fC %.0f%%）\n", saved, t, h);
+      found = saved;
+    }
+  }
+  if (found < 0) found = probeDhtPin();
+  if (found >= 0) prefs.putInt("dhtPin", found);
+  dhtPin = (found >= 0) ? found : PIN_DHT;
+  dht = new DHT(dhtPin, DHTTYPE);
+  dht->begin();
 
   // 饲料槽压力传感器
   pinMode(PIN_FEED_FSR, INPUT);
@@ -279,6 +299,37 @@ void loop() {
   }
 }
 
+// 逐个引脚试 DHT11，返回能读到数据的那个脚，读不到返回 -1
+int probeDhtPin() {
+  const int pins[11] = { PIN_DHT, 0, 2, 14, 21, 38, 39, 40, 45, 46, 48 };
+  Serial.print("[诊断] DHT11 探测:");
+  for (int i = 0; i < 11; i++) {
+    DHT probe(pins[i], DHTTYPE);
+    probe.begin();
+    delay(1200);                  // DHT11 换脚后需要 1 秒以上稳定
+    float t = probe.readTemperature();
+    float h = probe.readHumidity();
+    if (isnan(t) || isnan(h)) {   // 第一次常返回 NaN，隔一秒再读一次
+      delay(1100);
+      t = probe.readTemperature();
+      h = probe.readHumidity();
+    }
+    bool ok = !isnan(t) && !isnan(h);
+    // 顺便测一下这条线的电压：接好的 DHT 数据线空闲时被上拉到 3.3V（接近 4095），
+    // 完全没接的脚会读到漂移的低值
+    pinMode(pins[i], INPUT_PULLUP);
+    delay(5);
+    int lvl = analogRead(pins[i]);
+    Serial.printf(" GPIO%d=%s(线电压%d)", pins[i], ok ? "有数据" : "-", lvl);
+    if (ok) {
+      Serial.printf("（%.1fC %.0f%%）\n", t, h);
+      return pins[i];
+    }
+  }
+  Serial.println(" 全部无响应（检查 DATA 线、3V3、GND）");
+  return -1;
+}
+
 // 在指定引脚上试听 CO2 数据，收到合法帧就返回 true
 bool probeCo2(int pin, unsigned long windowMs) {
   co2Serial.end();
@@ -307,9 +358,9 @@ bool probeCo2(int pin, unsigned long windowMs) {
 
 // 开机自动找 CO2 接在哪个脚：先试新脚 14，再试旧脚 2，都不行就用上次记录的
 void initCo2() {
-  const int candidates[2] = { PIN_CO2_RX, 2 };
-  for (int i = 0; i < 2; i++) {
-    if (probeCo2(candidates[i], 2500)) {
+  const int candidates[6] = { PIN_CO2_RX, 2, 38, 40, 21, 48 };
+  for (int i = 0; i < 6; i++) {
+    if (probeCo2(candidates[i], 1500)) {
       co2Pin = candidates[i];
       prefs.putInt("co2Pin", co2Pin);
       Serial.printf("[JW01] 在 GPIO%d 上收到数据，CO2=%.0fppm\n", co2Pin, co2);
@@ -409,15 +460,10 @@ void handleCalibCmd() {
 void readSensors() {
   // DHT11 至少 2 秒才能读一次；每次失败都重新初始化总线再试，
   // 这块传感器接长线时容易卡死，重初始化是唯一能把它救回来的办法
-  if (lastDht == 0 || millis() - lastDht >= 3000) {
+  if (lastDht == 0 || millis() - lastDht >= 2500) {
     lastDht = millis();
-    float t = NAN, h = NAN;
-    for (int attempt = 0; attempt < 2; attempt++) {
-      t = dht.readTemperature();
-      h = dht.readHumidity();
-      if (!isnan(t) && !isnan(h)) break;
-      delay(200);
-    }
+    float t = dht->readTemperature();
+    float h = dht->readHumidity();
     if (!isnan(t) && !isnan(h)) {
       temp = t; hum = h; dhtOk = true; dhtFail = 0;
     } else {

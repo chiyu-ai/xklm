@@ -521,6 +521,53 @@ const METRIC_LABELS = {
   camera_count: '画面数量'
 };
 
+// 饲料槽证据：余量百分比 + 剩余重量 + 近 24 小时趋势
+// 采食量下降往往是疫病最早的信号，比体温变化还早，所以单独算趋势给模型看
+function feedEvidence(device) {
+  const latest = device.latest || {};
+  const level = latest.feed_level !== undefined ? Number(latest.feed_level) : null;
+  if (level === null || !isFinite(level)) return null;
+
+  const daily = Number(device.meta && device.meta.feed_daily) || 0;
+  const weight = daily > 0 ? Number(((daily * level) / 100).toFixed(2)) : null;
+
+  // 趋势：最近 30 个采样点的均值 vs 更早 30 个点的均值
+  const hist = (device.history || []).filter((h) => h.feed_level !== undefined).map((h) => Number(h.feed_level));
+  let trend = '';
+  if (hist.length >= 20) {
+    const recent = hist.slice(-30);
+    const before = hist.slice(-60, -30);
+    if (before.length >= 10) {
+      const avgR = recent.reduce((a, b) => a + b, 0) / recent.length;
+      const avgB = before.reduce((a, b) => a + b, 0) / before.length;
+      const diff = avgR - avgB;
+      if (diff > 8) trend = '余量持续上升（吃得更少）';
+      else if (diff < -8) trend = '余量持续下降（采食增加或正在补料）';
+      else trend = '余量基本平稳';
+    }
+  }
+
+  let status, advice;
+  if (level <= 20) {
+    status = '正常';
+    advice = '采食正常，下一次投喂前基本吃净';
+  } else if (level <= 40) {
+    status = '剩料偏多';
+    advice = '采食量下降，需排查饲料适口性、霉变、饮水、热应激或消化道疾病';
+  } else {
+    status = '采食明显不足';
+    advice = '采食量显著下降，是疾病早期的重要信号，建议立即检查群体精神状态、粪便性状与体温';
+  }
+
+  const lines = [];
+  lines.push('饲料槽余量：' + level + '%（判定：' + status + '）');
+  if (daily > 0) lines.push('每日投喂量：' + daily + ' kg，折合剩余约 ' + weight + ' kg');
+  else lines.push('每日投喂量：未填写（只能看余量百分比，无法折算重量）');
+  if (trend) lines.push('近期趋势：' + trend);
+  lines.push('判读：' + advice);
+  return { level, weight, daily, status, trend, text: lines.join('\n') };
+}
+
 // 对比该物种/阶段正常范围，列出当前偏离的指标
 function envAnomalies(device) {
   const summary = deviceSummary(device);
@@ -630,12 +677,6 @@ function buildHealthPrompt(device) {
   if (latest.co2 !== undefined) env.push('二氧化碳 ' + latest.co2 + 'ppm');
   if (latest.ammonia !== undefined) env.push('氨气 ' + latest.ammonia + 'ppm');
   if (latest.light !== undefined) env.push('光照 ' + latest.light + '%');
-  if (latest.feed_level !== undefined) {
-    const fd = Number(summary.feed.daily) || 0;
-    env.push('饲料槽余量 ' + latest.feed_level + '%' +
-      (fd > 0 ? '（每日投喂 ' + fd + 'kg，约剩 ' + summary.feed.weight + 'kg）' : '') +
-      (Number(latest.feed_level) > 20 ? '，剩料偏多，提示采食不足' : '，采食正常'));
-  }
   if (latest.camera_count !== undefined) env.push('摄像头识别数量 ' + latest.camera_count + ' 只');
   if (device.meta && device.meta.camera_status) {
     env.push('画面识别：' + String(device.meta.camera_status).replace(/\s+/g, ' ').slice(0, 140));
@@ -667,6 +708,15 @@ function buildHealthPrompt(device) {
     : '【画面识别】\n未检测到物体或物体状况（摄像头无画面或未完成识别）。\n' +
       '· 请在结论开头明确写出「因未检测到物体状况，本次判断仅基于环境数据、历史记录与通用知识」，然后再给出后续预警。';
 
+  const feedEv = feedEvidence(device);
+  const feedBlock = feedEv
+    ? '【饲料槽采食证据（重要）】\n' + feedEv.text +
+      '\n· 采食量变化通常早于体温和外观症状出现，' +
+      (feedEv.level > 20
+        ? '本次余量偏高，请把「采食不足」作为候选疾病的支撑证据之一，并在结论中说明它支持哪些病、排除哪些病。'
+        : '本次采食正常，可作为排除「急性消化道疾病、高热性疾病」的参考。')
+    : '【饲料槽采食证据】\n未接入饲料槽传感器或暂无数据，本次判断不含采食信息。';
+
   return [
     '【任务】你是养殖场智能预警助手。本系统的核心优势是实时环境监测，请【首先】基于下面的实时环境数据（尤其是超标项）分析病因与风险，再结合画面识别、本场历史记录与物种通用知识。',
     '画面识别结果必须作为判断依据之一：识别到动物时，必须说明画面中的数量与活动状态；未识别到时，必须说明这一点后再给出判断。',
@@ -674,6 +724,8 @@ function buildHealthPrompt(device) {
     '【实时环境数据（核心依据，优先分析）】',
     env.join('，') || '暂无数据',
     '【指标偏离情况】' + anomalyText,
+    '',
+    feedBlock,
     '',
     camBlock,
     '',
@@ -689,10 +741,10 @@ function buildHealthPrompt(device) {
     '【该物种常见疫病与诱因（通用知识）】',
     diseases || '暂无',
     '',
-    '【判断规则】1. 优先分析环境超标项与疾病的因果关系，这是本系统最可靠的依据；2. 其次参考本场历史记录；3. 最后参考通用知识。冲突时说明差异。',
+    '【判断规则】1. 优先分析环境超标项与疾病的因果关系，这是本系统最可靠的依据；2. 采食证据必须纳入判断：余量偏高（采食不足）要作为支撑证据，说明它指向哪些病、提示排查什么；3. 其次参考本场历史记录；4. 最后参考通用知识。冲突时说明差异。',
     '',
     '【输出要求】请务必详细、分点展开，不要只写一两句。',
-    '一、总体风险判断：给出风险等级（低/中/高），明确指出由哪几项环境指标驱动，并说明画面识别结果（动物数量、活动状态）是否支持该判断；若未识别到画面，先说明「因未检测到物体状况，本次判断仅基于环境数据与历史记录」。',
+    '一、总体风险判断：给出风险等级（低/中/高），明确指出由哪几项环境指标驱动，并单列一句说明采食状况（余量百分比 + 判读结论）对判断的影响；再说明画面识别结果（动物数量、活动状态）是否支持该判断；若未识别到画面，先说明「因未检测到物体状况，本次判断仅基于环境数据与历史记录」。',
     '二、可能疾病清单：按可能性从高到低排列，每种疾病给出：可能性（百分比）、判断依据（重点写环境数据、成长阶段、体重、病前征兆）。',
     '三、防治方案：针对每种疾病，分三个阶段详细给出：',
     '  【病前预防】环境管理（温湿度/通风/密度/光照）、免疫程序、消毒制度、饲料营养、日常观察要点；',
@@ -2012,11 +2064,12 @@ function buildEnvironmentContext() {
     if (l.noise !== undefined) parts.push(`噪声 ${l.noise}dB`);
     if (l.o2 !== undefined) parts.push(`氧气 ${l.o2}%`);
     if (l.soil_temp !== undefined) parts.push(`土壤温度 ${l.soil_temp}°C`);
-    if (l.feed_level !== undefined) {
-      const fd = Number(d.meta && d.meta.feed_daily) || 0;
-      parts.push(`饲料槽余量 ${l.feed_level}%` +
-        (fd > 0 ? `（每日投喂 ${fd}kg，约剩 ${((fd * Number(l.feed_level)) / 100).toFixed(2)}kg）` : '') +
-        (Number(l.feed_level) > 20 ? '，剩料偏多提示采食不足' : '，采食正常'));
+    const fev = feedEvidence(d);
+    if (fev) {
+      parts.push(`饲料槽余量 ${fev.level}%` +
+        (fev.daily > 0 ? `（每日投喂 ${fev.daily}kg，约剩 ${fev.weight}kg）` : '') +
+        `，判读：${fev.status}` +
+        (fev.trend ? `，${fev.trend}` : ''));
     }
     if (l.feed_activity !== undefined) parts.push(`进食活动 ${l.feed_activity}`);
     if (l.camera_count !== undefined) parts.push(`摄像头识别数量 ${l.camera_count} 只`);
@@ -2217,7 +2270,7 @@ async function handleChat(body) {
     '【工作规则】',
     '1. 如果用户提供的信息不完整（缺少物种/品种、日龄、症状、持续时间、环境数据等关键信息），请先暂停分析，用简洁的问题向用户询问缺失的信息；得到补充后再继续，绝不编造或假设。',
     '2. 回答先给结论，再给依据，最后给具体处置建议，分点简洁。',
-    '3. 判断顺序：先分析实时环境数据（尤其是超标项）与该物种疾病的因果关系——这是本系统最可靠的依据；再参考本场历史记录；最后参考通用知识。冲突时说明差异。',
+    '3. 判断顺序：先分析实时环境数据（尤其是超标项）与该物种疾病的因果关系——这是本系统最可靠的依据；再结合饲料槽采食数据（余量偏高即采食不足，是疾病早期信号，必须作为支撑或排除依据）；再参考本场历史记录；最后参考通用知识。冲突时说明差异。',
     '4. 必须优先参考该个体的既往病史；如果是复诊，请说明与上次相比的变化（好转/恶化/无变化）。',
     '5. 给出治疗方案后，提醒用户：等个体好转后回来告知，以便记录疗效、更新档案。',
     '6. 如果判断需要用药，请在回答末尾单独输出一段：',
