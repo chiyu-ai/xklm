@@ -27,8 +27,9 @@
 #include <mbedtls/base64.h>
 
 // WiFi 与服务器
-const char* ssid      = "你的WiFi名称";
-const char* password  = "你的WiFi密码";
+#include "secrets.h"          // WiFi 账号密码放这里，不进仓库
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 const char* serverUrl = "http://106.55.251.138:3000/api/data";
 const char* camUrl    = "http://106.55.251.138:3000/api/camera/esp32-01";
 const char* DEVICE_ID = "esp32-01";
@@ -92,6 +93,7 @@ bool fsrCalibrated = false;
 #define READ_INTERVAL   1000    // 传感器每 1 秒采集一次
 #define PAGE_INTERVAL   3000
 #define CAM_INTERVAL    1000    // 摄像头保持 1 秒一帧
+#define CAM_UPLOAD_ENABLED 1    // 1=上传快照，0=暂停（排查用）
 
 DHT dht(PIN_DHT, DHTTYPE);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -111,11 +113,15 @@ bool fsrOk = false;
 Preferences prefs;                   // 标定值存 NVS
 
 float temp = 0, hum = 0, co2 = 0;
+bool co2Ok = false;                  // 是否收到过合法的 CO2 帧
+int co2Pin = PIN_CO2_RX;              // 实际使用的 CO2 接收脚（开机自动探测）
 bool dhtOk = false;                  // DHT11 本次读数是否有效
 unsigned long lastDht = 0;           // 上次读取 DHT 的时间
+unsigned long lastDhtReset = 0;       // 上次重开 DHT 总线的时间
 int dhtFail = 0;                     // 连续失败次数
 int soilRaw = 0, lightRaw = 0, flame = 0;
 unsigned long lastRead = 0, lastReport = 0, lastPage = 0, lastCam = 0;
+unsigned long lastNetLog = 0;
 int page = 0;
 bool wifiOk = false, camOk = false;
 
@@ -207,6 +213,7 @@ void setup() {
   delay(200);
 
   pinMode(PIN_FLAME, INPUT);
+  pinMode(PIN_DHT, INPUT_PULLUP);   // DHT11 数据线靠上拉维持电平
   dht.begin();
 
   // 饲料槽压力传感器
@@ -221,8 +228,8 @@ void setup() {
   Serial.printf("[饲料槽] 标定 empty=%d full=%d cal=%d（串口 t/f/r/c）\n",
     fsrEmptyVal, fsrFullVal, fsrCalibrated ? 1 : 0);
 
-  // JW01 二氧化碳（只收不发）
-  co2Serial.begin(9600, SERIAL_8N1, PIN_CO2_RX, PIN_CO2_TX);
+  // JW01 二氧化碳：开机自动探测接在哪个脚（14 或 2），探测最多 5 秒
+  initCo2();
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println("OLED 失败");
@@ -259,11 +266,61 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) reconnectWifi();
     if (WiFi.status() == WL_CONNECTED) reportEnv();
   }
+  // 每 15 秒打印一次网络状态，排查断网用
+  if (millis() - lastNetLog >= 15000) {
+    lastNetLog = millis();
+    Serial.printf("[网络] status=%d RSSI=%d IP=%s\n",
+      (int)WiFi.status(), WiFi.RSSI(), WiFi.localIP().toString().c_str());
+  }
   if (millis() - lastCam >= CAM_INTERVAL) {
     lastCam = millis();
     // 有浏览器在拉视频流时，跳过快照（避免抢摄像头）
-    if (!streamingActive && camOk && WiFi.status() == WL_CONNECTED) captureAndUpload();
+    if (CAM_UPLOAD_ENABLED && !streamingActive && camOk && WiFi.status() == WL_CONNECTED) captureAndUpload();
   }
+}
+
+// 在指定引脚上试听 CO2 数据，收到合法帧就返回 true
+bool probeCo2(int pin, unsigned long windowMs) {
+  co2Serial.end();
+  co2Serial.begin(9600, SERIAL_8N1, pin, -1);
+  co2Idx = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < windowMs) {
+    if (!co2Serial.available()) { delay(2); continue; }
+    uint8_t b = co2Serial.read();
+    if (co2Idx == 0 && b != 0x2C) continue;
+    co2Frame[co2Idx++] = b;
+    if (co2Idx >= 6) {
+      uint8_t sum = 0;
+      for (int i = 0; i < 5; i++) sum += co2Frame[i];
+      if (sum == co2Frame[5]) {
+        co2 = (co2Frame[1] << 8) | co2Frame[2];
+        co2Ok = true;
+        co2Idx = 0;
+        return true;
+      }
+      co2Idx = 0;
+    }
+  }
+  return false;
+}
+
+// 开机自动找 CO2 接在哪个脚：先试新脚 14，再试旧脚 2，都不行就用上次记录的
+void initCo2() {
+  const int candidates[2] = { PIN_CO2_RX, 2 };
+  for (int i = 0; i < 2; i++) {
+    if (probeCo2(candidates[i], 2500)) {
+      co2Pin = candidates[i];
+      prefs.putInt("co2Pin", co2Pin);
+      Serial.printf("[JW01] 在 GPIO%d 上收到数据，CO2=%.0fppm\n", co2Pin, co2);
+      return;
+    }
+  }
+  co2Pin = prefs.getInt("co2Pin", PIN_CO2_RX);
+  co2Serial.end();
+  co2Serial.begin(9600, SERIAL_8N1, co2Pin, -1);
+  co2Ok = false;
+  Serial.printf("[JW01] 两个脚都没收到数据，暂用 GPIO%d（检查 B 线、5V 供电）\n", co2Pin);
 }
 
 // JW01 串口 CO2：6 字节帧（2C HH LL X Y CK），前 5 字节之和 = 第 6 字节（校验）
@@ -279,6 +336,7 @@ float readCO2() {
         co2Frame[0], co2Frame[1], co2Frame[2], co2Frame[3], co2Frame[4], co2Frame[5], sum);
       if (sum == co2Frame[5]) {
         co2 = (co2Frame[1] << 8) | co2Frame[2];
+        co2Ok = true;          // 收到过合法帧才上报，没收到就不发这个字段
       }
       co2Idx = 0;
     }
@@ -349,22 +407,21 @@ void handleCalibCmd() {
 }
 
 void readSensors() {
-  // DHT11 读取间隔 2.5 秒 + 3 次重试（实测这组参数最稳）
-  if (lastDht == 0 || millis() - lastDht >= 2500) {
+  // DHT11 至少 2 秒才能读一次；每次失败都重新初始化总线再试，
+  // 这块传感器接长线时容易卡死，重初始化是唯一能把它救回来的办法
+  if (lastDht == 0 || millis() - lastDht >= 3000) {
     lastDht = millis();
     float t = NAN, h = NAN;
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0; attempt < 2; attempt++) {
       t = dht.readTemperature();
       h = dht.readHumidity();
       if (!isnan(t) && !isnan(h)) break;
-      delay(150);
+      delay(200);
     }
     if (!isnan(t) && !isnan(h)) {
       temp = t; hum = h; dhtOk = true; dhtFail = 0;
     } else {
       dhtFail++;
-      // 连续失败时重新初始化总线，能救回卡住的传感器
-      if (dhtFail % 2 == 0) dht.begin();
       // 连续失败 6 次（约 15 秒）才判定失效，短暂抖动不影响显示
       if (dhtFail >= 6) dhtOk = false;
     }
@@ -409,10 +466,16 @@ void drawDisplay() {
 
 void reconnectWifi() {
   if (WiFi.status() == WL_CONNECTED) { wifiOk = true; return; }
+  Serial.printf("[网络] 重连中 status=%d\n", (int)WiFi.status());
   WiFi.disconnect(); WiFi.begin(ssid, password);
   unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(200);
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 4000) delay(200);
   wifiOk = (WiFi.status() == WL_CONNECTED);
+  if (wifiOk) {
+    Serial.printf("[网络] 已连上 %s RSSI=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("[网络] 重连失败，检查热点是否开启");
+  }
 }
 
 void reportEnv() {
@@ -426,7 +489,9 @@ void reportEnv() {
   http.setTimeout(5000);
   String payload = "{\"device_id\":\"" + String(DEVICE_ID) + "\",\"name\":\"" + String(DEVICE_NAME) + "\","
     + (dhtOk ? ("\"temperature\":" + String(temp, 1) + ",\"humidity\":" + String(hum, 0) + ",") : "")
-    + "\"soil\":" + String(soilPct) + ",\"co2\":" + String(co2, 0) + ",\"light\":" + String(lightPct) + ",\"flame\":" + String(fire) + ","
+    + "\"soil\":" + String(soilPct) + ","
+    + (co2Ok ? ("\"co2\":" + String(co2, 0) + ",") : "")
+    + "\"light\":" + String(lightPct) + ",\"flame\":" + String(fire) + ","
     + (fsrOk ? ("\"feed_level\":" + String(feedLevel) + ",") : "")
     + "\"local_ip\":\"" + localIp + "\",\"stream_port\":81}";
   int code = http.POST(payload);

@@ -4,6 +4,7 @@
   "dataDir": "data",
   "historyLimit": 500,
   "offlineAfterMs": 120000,
+  "staleAfterMs": 30000,
   "thresholds": {
     "temperature": { "min": 10, "max": 35, "unit": "°C" },
     "humidity": { "min": 40, "max": 80, "unit": "%" },

@@ -41,6 +41,8 @@ const ILLNESS_DIR = path.join(DATA_DIR, 'illness');
 const WARNING_DIR = path.join(DATA_DIR, 'warnings');
 const HISTORY_LIMIT = Number(config.historyLimit) || 500;
 const OFFLINE_AFTER_MS = Number(config.offlineAfterMs) || 120000;
+// 单个指标多久没更新算失效。传感器偶发读失败时保留上一次的值，超过这个时间才丢弃
+const STALE_AFTER_MS = Number(config.staleAfterMs) || 30000;
 const THRESHOLDS = config.thresholds || {};
 // 智能体配置：环境变量优先，便于部署时不把密钥写入配置文件
 const AGENT = Object.assign({}, config.agent || {}, {
@@ -879,9 +881,21 @@ function upsertDevice(deviceId, name, body, ip) {
 
   const metrics = extractMetrics(body);
   const latest = { time: ts, ...metrics };
-  // 摄像头识别数量来自 AI 识别，传感器上报不带这个字段，替换 latest 时保留
-  if (device.latest && device.latest.camera_count !== undefined && latest.camera_count === undefined) {
-    latest.camera_count = device.latest.camera_count;
+  // 传感器偶发失败时，payload 里会直接缺这个字段（例如 DHT11 读失败就不带温湿度）。
+  // 如果整条替换 latest，页面上对应卡片就会一会儿有一会儿没有。
+  // 这里沿用上一刻的值，配合 deviceSummary 里的超时判定，
+  // 短暂失败保留旧值，真的失效了才让指标消失。
+  if (device.latest) {
+    for (const [k, v] of Object.entries(device.latest)) {
+      if (k === 'time') continue;
+      if (latest[k] === undefined) latest[k] = v;
+    }
+  }
+  device.fieldSeen = device.fieldSeen || {};
+  for (const k of Object.keys(metrics)) device.fieldSeen[k] = ts;
+  // 摄像头数量来自 AI 识别，单独记时，避免按传感器超时把它清掉
+  if (device.latest && device.latest.camera_count !== undefined && metrics.camera_count === undefined) {
+    if (!device.fieldSeen.camera_count) device.fieldSeen.camera_count = ts;
   }
 
   device.latest = latest;
@@ -964,12 +978,23 @@ function deviceSummary(device) {
   const latest = device.latest || {};
   const metrics = {};
   const speciesName = (device.meta && device.meta.species) || '';
+  const seen = device.fieldSeen || {};
+  const tsNow = now();
+  const online = tsNow - (device.lastSeen || 0) < OFFLINE_AFTER_MS;
   for (const [k, v] of Object.entries(latest)) {
     if (k === 'time') continue;
+    // 只有设备在线时才按超时剔除指标：单个传感器短时失败时，
+    // 旧值先留着（页面不闪）；真的停了超过 staleAfterMs 才消失。
+    // 设备整体离线时保留最后一次读数，页面靠离线条区分，不能再把值抹掉。
+    if (online && k !== 'camera_count') {
+      const t = seen[k];
+      if (t && tsNow - t > STALE_AFTER_MS) continue;
+    }
     metrics[k] = { value: v, status: evaluateMetric(k, v), severity: severityOf(k, v, speciesName) };
+    if (seen[k]) metrics[k].updatedAt = seen[k];
   }
 
-  const online = now() - (device.lastSeen || 0) < OFFLINE_AFTER_MS;
+  // online 已在上方计算
 
   // 饲料槽：传感器给槽内余量百分比，每日投喂量由用户填
   // 规则：次日剩余 ≤20% 说明吃干净了（正常）；>20% 说明采食不足

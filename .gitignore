@@ -29,3 +29,5 @@ build/
 *.elf
 *.bin
 *.map
+# 固件私有配置（WiFi 账号密码）
+firmware/esp32_s3_farm_camera/secrets.h
